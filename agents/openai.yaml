@@ -1,0 +1,7 @@
+interface:
+  display_name: "Solve with WeiLan"
+  short_description: "Apply the WeiLan cycle to every task"
+  default_prompt: "Use $solve-with-weilan to solve this task with proportional frame depth and collapse discipline."
+
+policy:
+  allow_implicit_invocation: true
