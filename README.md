@@ -1,23 +1,23 @@
 # Solve with WeiLan / 微澜方法 Skill
 
-`solve-with-weilan` is a Codex Skill that applies the WeiLan problem-solving method to ordinary engineering tasks, research work, and long-running agent workflows.
+`solve-with-weilan` is a Codex Skill that helps an agent apply the WeiLan method while it works. It is not mainly a checklist for a human reader; it is an operating contract for Codex/agent behavior.
 
-`solve-with-weilan` 是一个 Codex Skill，用来把微澜方法应用到日常工程任务、研究任务和长期 agent 工作流中。
+`solve-with-weilan` 是一个让 Codex/agent 在工作过程中应用微澜方法的 Skill。它主要不是给人类读者逐条手动执行的清单，而是给 Codex/agent 使用的运行契约。
 
 ## What It Does / 功能概览
 
-- Proportional task framing: choose L0 to L3 depth according to risk, uncertainty, and cost.
-- 倍率化任务框定：根据风险、不确定性和成本，在 L0 到 L3 之间选择合适深度。
-- Temporary holder and collapse discipline: keep the current route only while it keeps producing useful evidence.
-- 临时 holder 与 collapse 纪律：当前路线只有在持续产生有效证据时才保持主导。
-- Frame and Trace ledger: persist observable L2/L3 decisions, evidence, route changes, and receipts.
-- Frame/Trace 账本：持久化 L2/L3 的可观察决策、证据、路线变化和收据。
-- Workspace memory recall: restore active scope, paused state, lineage, and reusable semantic memory from append-only records.
-- 工作区记忆召回：从 append-only 记录恢复 active scope、paused state、lineage 和可复用语义记忆。
-- Governance, prospective planning, metabolic transaction, transition planning, and bounded runner modules for controlled long-horizon work.
-- 包含治理、前瞻计划、代谢事务、转移计划和有界 runner 模块，用于受控的长期工作。
-- Skill Evolution support: integrate with external proposal, evaluation, adoption, deployment, and rollback workflows.
-- Skill Evolution 支持：对接外部 proposal、evaluation、adoption、deployment 和 rollback 工作流。
+- Proportional framing: the agent chooses L0 to L3 depth according to task risk, uncertainty, and cost.
+- 倍率化任务框定：agent 会根据任务风险、不确定性和成本，在 L0 到 L3 之间选择合适深度。
+- Temporary holder and collapse discipline: the agent keeps the current route only while it keeps producing useful evidence.
+- 临时 holder 与 collapse 纪律：agent 只在当前路线持续产生有效证据时保持它的主导地位。
+- Frame and Trace ledger: for L2/L3 work, the agent records observable decisions, evidence, route changes, and receipts.
+- Frame/Trace 账本：对于 L2/L3 工作，agent 会记录可观察的决策、证据、路线变化和收据。
+- Workspace memory recall: the agent restores active scope, paused state, lineage, and reusable semantic memory from append-only records.
+- 工作区记忆召回：agent 会从 append-only 记录中恢复 active scope、paused state、lineage 和可复用语义记忆。
+- Long-horizon control modules: governance, prospective planning, metabolic transaction, transition planning, and bounded runner support controlled multi-step work.
+- 长程控制模块：governance、prospective planning、metabolic transaction、transition planning 和 bounded runner 支持受控的多步骤工作。
+- Skill Evolution support: the agent can coordinate with external proposal, evaluation, adoption, deployment, and rollback workflows.
+- Skill Evolution 支持：agent 可以对接外部 proposal、evaluation、adoption、deployment 和 rollback 工作流。
 
 ## Repository Layout / 仓库结构
 
@@ -25,25 +25,25 @@
 SKILL.md                 Main Codex Skill entrypoint / Codex Skill 主入口
 agents/openai.yaml       Agent configuration / agent 配置
 references/              Method contracts and subsystem specs / 方法契约与子系统说明
-scripts/weilan_trace.py  Main CLI for Frame, memory, governance, and runner operations / 主 CLI
+scripts/weilan_trace.py  Main CLI used by the agent / agent 使用的主 CLI
 scripts/*.py             Runtime modules and tests / 运行模块与测试
 theory/                  WeiLan theory notes from WeilanSkillEvolution / 微澜理论资料
 ```
 
 ## Install / 安装
 
-Clone this repository into your Codex skills directory:
+This is a one-time setup step for the Codex environment owner or maintainer. Ordinary end users normally do not need to run the commands during task work.
 
-将本仓库克隆到 Codex skills 目录：
+这是给 Codex 环境所有者或维护者的一次性安装步骤。普通使用者在日常任务中通常不需要手动运行这些命令。
 
 ```powershell
 $skills = if ($env:CODEX_HOME) { Join-Path $env:CODEX_HOME "skills" } else { Join-Path $HOME ".codex\skills" }
 git clone https://github.com/ecosystem788/solve-with-weilan.git (Join-Path $skills "solve-with-weilan")
 ```
 
-If the directory already exists, update it with:
+To update an existing installation:
 
-如果目录已经存在，用下面命令更新：
+更新已有安装：
 
 ```powershell
 cd (Join-Path $skills "solve-with-weilan")
@@ -54,34 +54,38 @@ After installation, Codex can invoke the skill as `$solve-with-weilan`.
 
 安装后，Codex 可以通过 `$solve-with-weilan` 调用这个 Skill。
 
-## Basic Use / 基本使用
+## Agent Operation / Agent 自动运行方式
 
-At the first task of a new run, recall the current workspace state:
+The following commands document what the agent should do internally. They are not instructions that a normal reader must run by hand.
 
-每次新 run 的第一个任务，先召回当前工作区状态：
+下面这些命令说明 agent 内部应该如何运行。它们不是普通读者必须手动执行的使用步骤。
+
+At the first task of a new run, the agent recalls the current workspace state:
+
+在每次新 run 的第一个任务里，agent 会召回当前工作区状态：
 
 ```powershell
 python scripts/weilan_trace.py memory-recall --workspace "<cwd>"
 ```
 
-Then follow the returned `activation.state`:
+The agent then obeys the returned `activation.state`:
 
-然后按返回的 `activation.state` 执行：
+然后 agent 按返回的 `activation.state` 执行：
 
-- `ACTIVE`: continue after verifying task-relevant sources.
+- `ACTIVE`: verify task-relevant sources, then continue.
 - `ACTIVE`：验证当前任务相关来源后继续。
-- `PAUSED`: report only; do not resume from a bare "continue".
-- `PAUSED`：只报告状态；不能用简单的 "continue" 自动恢复。
-- `CONFIRM_REQUIRED`: ask the user which scope or direction to use.
-- `CONFIRM_REQUIRED`：向用户确认 scope 或方向。
-- `STALE`: rebuild projection, then recall again.
+- `PAUSED`: report only; a bare "continue" does not resume the scope.
+- `PAUSED`：只报告状态；简单的 "continue" 不会自动恢复 scope。
+- `CONFIRM_REQUIRED`: ask the user which scope or direction is intended.
+- `CONFIRM_REQUIRED`：向用户确认目标 scope 或方向。
+- `STALE`: rebuild the projection, then recall again.
 - `STALE`：先 rebuild projection，再重新 recall。
 - `NO_CONTEXT`: start clean from the current request.
 - `NO_CONTEXT`：不继承旧上下文，从当前请求开始。
 
-For material L2/L3 work, open and close a Frame:
+For material L2/L3 work, the agent opens a Frame, records the holder and evidence, completes the persistence audit, closes the Frame, and validates the receipt:
 
-对于重要的 L2/L3 工作，打开并关闭 Frame：
+对于重要的 L2/L3 工作，agent 会打开 Frame，记录 holder 和 evidence，完成 persistence audit，关闭 Frame，并验证 receipt：
 
 ```powershell
 python scripts/weilan_trace.py open --level L2 --workspace "<cwd>" --scope "<scope>" --branch main --relation continue --parent "<frame-id>" --problem "..." --success "..."
@@ -93,8 +97,8 @@ python scripts/weilan_trace.py validate --frame-id "<frame-id>" --require-closed
 
 ## Main Modules / 主要模块
 
-- `weilan_trace.py`: command-line entrypoint for Frame/Trace, memory, evidence, governance, prospective planning, transactions, transition planning, and bounded runs.
-- `weilan_trace.py`：Frame/Trace、memory、evidence、governance、prospective planning、transaction、transition planning 和 bounded run 的命令行入口。
+- `weilan_trace.py`: command-line entrypoint the agent uses for Frame/Trace, memory, evidence, governance, prospective planning, transactions, transition planning, and bounded runs.
+- `weilan_trace.py`：agent 用于 Frame/Trace、memory、evidence、governance、prospective planning、transaction、transition planning 和 bounded run 的命令行入口。
 - `runtime_core.py`: shared filesystem, locking, JSONL, and receipt helpers.
 - `runtime_core.py`：共享文件系统、锁、JSONL 和 receipt 工具。
 - `governance.py`: append-only pressure and target lifecycle state.
@@ -105,8 +109,8 @@ python scripts/weilan_trace.py validate --frame-id "<frame-id>" --require-closed
 - `metabolism.py`：只读 metabolic contract 与 transition proposal 检查。
 - `transaction.py`: explicit prepare, commit, abort, and recover flows.
 - `transaction.py`：显式 prepare、commit、abort 和 recover 流程。
-- `transition_planner.py`: deterministic one-step collapse/regroup/materialization planning.
-- `transition_planner.py`：确定性单步 collapse、regroup、materialization 计划。
+- `transition_planner.py`: deterministic one-step collapse, regroup, and materialization planning.
+- `transition_planner.py`：确定性单步 collapse、regroup 和 materialization 计划。
 - `runner.py`: finite foreground runner for bounded event manifests.
 - `runner.py`：用于有界 event manifest 的有限前台 runner。
 
@@ -114,7 +118,7 @@ python scripts/weilan_trace.py validate --frame-id "<frame-id>" --require-closed
 
 The `theory/` directory contains source notes from `WeilanSkillEvolution`. These files preserve conceptual background and should be treated as theory provenance, not as automatic action authority.
 
-`theory/` 目录来自 `WeilanSkillEvolution`，保存微澜理论背景资料。它们是理论 provenance（来源依据），不是自动行动授权。
+`theory/` 目录来自 `WeilanSkillEvolution`，保存微澜理论背景资料。它们是 theory provenance（理论来源依据），不是自动行动授权。
 
 ## License / 协议
 
