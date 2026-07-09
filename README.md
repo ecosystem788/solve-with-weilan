@@ -1,8 +1,8 @@
 # Solve with WeiLan / 微澜方法 Skill
 
-`solve-with-weilan` is a Codex Skill that helps an agent apply the WeiLan method while it works. It is not mainly a checklist for a human reader; it is an operating contract for Codex/agent behavior.
+`solve-with-weilan` is a Codex/agent Skill that applies the WeiLan problem-solving method to ordinary engineering tasks, research work, and long-running agent workflows.
 
-`solve-with-weilan` 是一个让 Codex/agent 在工作过程中应用微澜方法的 Skill。它主要不是给人类读者逐条手动执行的清单，而是给 Codex/agent 使用的运行契约。
+`solve-with-weilan` 是一个 Codex/agent Skill，用来把微澜方法应用到日常工程任务、研究任务和长期 agent 工作流中。
 
 ## What It Does / 功能概览
 
