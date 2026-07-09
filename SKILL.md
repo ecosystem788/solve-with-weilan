@@ -1,6 +1,6 @@
 ---
 name: solve-with-weilan
-description: "Apply the WeiLan constrained-generation, temporary-holder, evidence, collapse, trace, and regroup method to every task with proportional depth. Use for all requests: exit quickly for trivial one-step tasks, use verification for routine work, and use explicit competing candidates plus persistent Frame/Trace events for uncertain, high-impact, long-running, or repeatedly failing work."
+description: "Apply the WeiLan constrained-generation, temporary-holder, evidence, collapse, trace, and regroup method to every task with proportional depth. Use a hard L0/L1 fast path for low-risk work: exit quickly for trivial one-step tasks, use narrow verification for routine work, and reserve explicit competing candidates plus persistent Frame/Trace events for uncertain, high-impact, long-running, externally visible, or repeatedly failing work."
 ---
 
 # Solve with WeiLan
@@ -40,6 +40,39 @@ For Memory 0.6 governance work, read [references/governance-system.md](reference
 For SE-0.4 future intentions, read [references/prospective-system.md](references/prospective-system.md). Register bounded causal conditions, append only explicit user/tool/environment/authorized-clock observations, and derive at most one read-only cycle plan. Never let an observation transition a goal automatically or create a timer, scheduler, heartbeat, wakeup, or background loop.
 
 For Skill Evolution work in a workspace with external roadmap, evaluation policy, and `tools/evolution_cli.py`, read [references/evolution-system.md](references/evolution-system.md). Keep proposal construction, content-addressed candidate freezing, evaluation, adoption, deployment, and rollback in that external authority plane. Never let the candidate approve its own cases, compare unequal trials, adopt itself, or treat Method Impact Trace as hidden reasoning.
+
+## Fast path has priority
+
+After mandatory activation/control checks, try the L0/L1 fast path before considering the broader method machinery. The fast path is the default, not an exception. L2/L3 must be justified by a concrete escalation trigger.
+
+For L0/L1 work, suppress nonessential WeiLan operations:
+
+- Do not open a Frame.
+- Do not create competing candidates.
+- Do not inspect lineage, governance, prospective state, transaction state, runner state, memory search, or episode search.
+- Do not read collapse, metabolism, transaction, transition-planner, runner, governance, or evolution references unless the task directly touches that subsystem.
+- Do not mention WeiLan, holder, collapse, death line, or trace to the user unless it helps the task outcome.
+- Do not persist events except explicit pause, resume, stop, block, close, or scope-redirection controls.
+
+Use **L0** when all of these are true:
+
+- the request can be answered or completed in one obvious step;
+- there is no file edit, external write, money/resource use, credential handling, or deployment;
+- there is no dependency on prior workspace state beyond the current prompt;
+- a wrong answer would be cheap and easy to correct.
+
+Use **L1** when the task is routine but needs a narrow check, file read, edit, or verification command. L1 keeps one route, one local working set, and one relevant verification. It stops after the receipt.
+
+Escalate out of the fast path only when at least one concrete trigger appears:
+
+- external visibility or irreversible action, including push, publish, deploy, adopt, delete, overwrite, spend, or permission changes;
+- continuation of long-running work where stale, paused, or ambiguous scope would change the correct action;
+- multiple plausible routes with meaningfully different cost, risk, or architecture;
+- repeated same-class failure or evidence that the current route is consuming budget without structural gain;
+- user asks for architecture, policy, adoption, evaluation, rollback, or other governance-level judgment;
+- the task touches Memory, Governance, Prospective, Transaction, Transition Planner, Runner, or Skill Evolution internals.
+
+If no trigger is present, L0/L1 wins even when the larger system has relevant machinery available.
 
 ## Choose proportional depth
 

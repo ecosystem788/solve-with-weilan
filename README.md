@@ -18,6 +18,8 @@
 - 长程控制模块：governance、prospective planning、metabolic transaction、transition planning 和 bounded runner 支持受控的多步骤工作。
 - Skill Evolution support: the agent can coordinate with external proposal, evaluation, adoption, deployment, and rollback workflows.
 - Skill Evolution 支持：agent 可以对接外部 proposal、evaluation、adoption、deployment 和 rollback 工作流。
+- Hard L0/L1 fast path: low-risk work stays lightweight unless a concrete escalation trigger appears.
+- 硬性 L0/L1 快速路径：低风险工作保持轻量，只有出现明确升级触发条件才进入重流程。
 
 ## Repository Layout / 仓库结构
 
@@ -59,6 +61,14 @@ After installation, Codex can invoke the skill as `$solve-with-weilan`.
 The following commands document what the agent should do internally. They are not instructions that a normal reader must run by hand.
 
 下面这些命令说明 agent 内部应该如何运行。它们不是普通读者必须手动执行的使用步骤。
+
+After mandatory activation/control checks, the agent first tries the L0/L1 fast path. For L0/L1 work it should not open Frames, create competing candidates, inspect lineage/governance/memory indexes, or mention WeiLan machinery unless that helps the task outcome.
+
+在完成必要的 activation/control 检查后，agent 会先尝试 L0/L1 快速路径。对于 L0/L1 工作，它不应该打开 Frame、创建竞争候选、检查 lineage/governance/memory index，也不应该向用户提起微澜机制，除非这些动作直接帮助任务结果。
+
+The agent escalates to L2/L3 only when there is a concrete trigger: external publish/deploy/push, irreversible edits, stale or paused long-running scope, real architectural alternatives, repeated failure, governance-level judgment, or direct work on the method internals.
+
+只有出现明确触发条件时，agent 才升级到 L2/L3：对外 publish/deploy/push、不可逆编辑、长期 scope 的 stale 或 paused 状态、真实架构分歧、重复失败、治理级判断，或直接修改方法内部机制。
 
 At the first task of a new run, the agent recalls the current workspace state:
 
