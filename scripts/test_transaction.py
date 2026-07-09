@@ -834,6 +834,7 @@ def main():
         method_state = root / "method-state"
         environment = os.environ.copy()
         environment["WEILAN_ALLOW_UNRESOLVED_CONVERSATION"] = "1"
+        environment["WEILAN_CODEX_SESSIONS_HOME"] = str(root / "sessions")
         environment["WEILAN_METHOD_HOME"] = str(method_state)
         cli_transaction_test(root, method_state, environment)
         stale_and_abort_test(root, method_state, environment)

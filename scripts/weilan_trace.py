@@ -1,12 +1,15 @@
 """Frame/Trace recorder and federated workspace memory for solve-with-weilan."""
 
 import argparse
+import copy
 import hashlib
 import json
 import os
 import re
 import sys
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -53,10 +56,13 @@ from metabolism import (
     propose_transition as propose_metabolic_transition,
 )
 from transaction import (
+    ContractConflict,
     TRANSACTION_SCHEMA_VERSION,
     abort_transaction,
     commit_transaction,
     contract_fence,
+    is_quarantined_torn_fragment,
+    iter_ledger_lines,
     load_transaction_records,
     normalize_intents as normalize_transaction_intents,
     prepare_transaction,
@@ -64,7 +70,9 @@ from transaction import (
     reduce_transactions,
     reset_visibility_snapshot,
     resolve_pending_record,
+    terminate_torn_tail,
     transaction_visibility_scope,
+    warn_torn_tail,
     workspace_contract_fence,
 )
 from transition_planner import (
@@ -109,7 +117,6 @@ TRANSACTION_PARTICIPANTS = (
     "persistence_audit",
 )
 CONTROL_STATES = ("active", "paused", "blocked", "closed")
-ACTIVATION_STATES = ("ACTIVE", "PAUSED", "CONFIRM_REQUIRED", "STALE", "NO_CONTEXT")
 MAX_PROJECTION_BYTES = 16 * 1024
 MAX_SEMANTIC_ENTRY_BYTES = 16 * 1024
 SEMANTIC_KINDS = ("decision", "constraint", "fact", "lesson", "procedure", "open_question")
@@ -220,19 +227,23 @@ def frame_repair_path(frame_id):
 def read_events_raw(path):
     events = []
     warnings = []
-    with path.open("r", encoding="utf-8") as handle:
-        for number, line in enumerate(handle, 1):
-            if not line.strip():
+    for number, offset, raw, terminated in iter_ledger_lines(path):
+        if not raw.strip():
+            continue
+        try:
+            record = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            if not terminated:
+                warn_torn_tail(path, number)
                 continue
-            try:
-                record = json.loads(line)
-                resolved = resolve_pending_record(
-                    state_root(), record, warnings, source_path=path
-                )
-                if resolved is not None:
-                    events.append(resolved)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"invalid JSON at line {number}: {exc}") from exc
+            if is_quarantined_torn_fragment(path, offset, raw):
+                continue
+            raise ValueError(f"invalid JSON at line {number}: {exc}") from exc
+        resolved = resolve_pending_record(
+            state_root(), record, warnings, source_path=path
+        )
+        if resolved is not None:
+            events.append(resolved)
     if warnings:
         raise ValueError("invalid pending transaction envelope: " + "; ".join(warnings))
     return events
@@ -280,21 +291,26 @@ def apply_frame_repairs(events, repairs, warnings=None):
 
 
 def read_events(path):
-    events = read_events_raw(path)
-    if not events:
-        return events
-    warnings = []
-    repairs = load_frame_repairs(events[0].get("frame_id"), warnings)
-    repaired = apply_frame_repairs(events, repairs, warnings)
-    if warnings:
-        raise ValueError("invalid frame repair ledger: " + "; ".join(warnings))
-    return repaired
+    def load():
+        events = read_events_raw(path)
+        if not events:
+            return events
+        warnings = []
+        repairs = load_frame_repairs(events[0].get("frame_id"), warnings)
+        repaired = apply_frame_repairs(events, repairs, warnings)
+        if warnings:
+            raise ValueError("invalid frame repair ledger: " + "; ".join(warnings))
+        return repaired
+
+    return memoized_value(("frame_events", str(path)), load)
 
 
 def append_event(path, event):
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8", newline="\n") as handle:
-        handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+    line = (json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    with path.open("a+b") as handle:
+        terminate_torn_tail(path, handle)
+        handle.write(line)
         handle.flush()
         os.fsync(handle.fileno())
 
@@ -638,19 +654,17 @@ def command_open_lineaged_fenced(args, workspace, scope):
         if updated_state["issues"]:
             raise RuntimeError("created invalid lineage transition: " + "; ".join(updated_state["issues"]))
         heads = write_lineage_heads(workspace, scope, updated_records, updated_state)
-        print(
-            json.dumps(
-                {
-                    "frame_id": frame_id,
-                    "path": str(frame_path),
-                    "causal": causal,
-                    "branch_heads_path": str(lineage_heads_path(workspace, scope)),
-                    "branch_heads": heads["branches"],
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
+        output = {
+            "frame_id": frame_id,
+            "path": str(frame_path),
+            "causal": causal,
+            "branch_heads_path": str(lineage_heads_path(workspace, scope)),
+            "branch_heads": heads["branches"],
+        }
+        attach_trace_advisory_result(
+            output, workspace, scope, " ".join([args.problem, args.success])
         )
+        print(json.dumps(output, ensure_ascii=False, indent=2))
 
 
 def command_lineage_show(args):
@@ -701,7 +715,9 @@ def command_open(args):
         "success_criteria": args.success,
         "budget": args.budget or "proportional",
     }
-    event = make_event(frame_id, "frame_opened", args.level, args.workspace, data)
+    event = make_event(
+        frame_id, "frame_opened", args.level, canonical_workspace(args.workspace), data
+    )
     append_event(path, event)
     print(json.dumps({"frame_id": frame_id, "path": str(path)}, ensure_ascii=False))
 
@@ -750,7 +766,15 @@ def command_event_fenced(args, path):
     if field_errors:
         raise ValueError("invalid frame event: " + "; ".join(field_errors))
     append_event(path, event)
-    print(json.dumps({"frame_id": args.frame_id, "event_type": args.type}, ensure_ascii=False))
+    output = {"frame_id": args.frame_id, "event_type": args.type}
+    if args.type in {"candidate_admitted", "holder_selected", "route_reentered"}:
+        attach_trace_advisory_result(
+            output,
+            first["workspace"],
+            frame_scope(events),
+            " ".join(str(value) for value in data.values()),
+        )
+    print(json.dumps(output, ensure_ascii=False))
 
 
 def required_persistence_audit_triggers(events):
@@ -1040,24 +1064,97 @@ def is_workspace_match(requested, candidate):
     return requested_normalized.startswith(prefix)
 
 
+_DERIVATION_MEMO = ContextVar("weilan_derivation_memo", default=None)
+
+
+@contextmanager
+def derivation_memo_scope():
+    """Memoize pure source-resolution reads inside one read-only derivation.
+
+    Enter this scope only around code whose reads are not followed by ledger
+    writes that those same reads must observe; a write inside the scope could
+    otherwise serve stale read-after-write data. Writes to derived caches
+    (projections, indexes) and to ledgers that are never snapshot sources
+    (governance appends) are safe. Nested scopes reuse the outermost memo.
+    """
+
+    if _DERIVATION_MEMO.get() is not None:
+        yield
+        return
+    token = _DERIVATION_MEMO.set({})
+    try:
+        yield
+    finally:
+        _DERIVATION_MEMO.reset(token)
+
+
+def memoized_records(kind, workspace, scope, warnings, loader):
+    """Serve one scoped ledger load per derivation, replaying its warnings."""
+
+    memo = _DERIVATION_MEMO.get()
+    if memo is None:
+        return loader(warnings)
+    key = (kind, workspace_key(workspace), scope_key(scope))
+    if key not in memo:
+        collected = []
+        memo[key] = (loader(collected), collected)
+    records, collected = memo[key]
+    if warnings is not None:
+        warnings.extend(collected)
+    return records
+
+
+def memoized_value(key, loader):
+    memo = _DERIVATION_MEMO.get()
+    if memo is None:
+        return loader()
+    if key not in memo:
+        memo[key] = loader()
+    return memo[key]
+
+
+def memoized_derivation(func):
+    """Run a read-only derivation inside one shared memo scope.
+
+    Apply only to functions that never perform writes their own later reads
+    must observe. Derived-cache writes (projection, index files) and
+    governance-ledger appends are safe because no memoized loader reads them.
+    """
+
+    def wrapper(*args, **kwargs):
+        with derivation_memo_scope():
+            return func(*args, **kwargs)
+
+    wrapper.__name__ = func.__name__
+    wrapper.__doc__ = func.__doc__
+    return wrapper
+
+
 def read_jsonl_records(path, warnings):
     records = []
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            for number, line in enumerate(handle, 1):
-                if not line.strip():
-                    continue
-                try:
-                    record = json.loads(line)
-                    resolved = resolve_pending_record(
-                        state_root(), record, warnings, source_path=path
-                    )
-                    if resolved is not None:
-                        records.append(resolved)
-                except json.JSONDecodeError as exc:
-                    warnings.append(f"{path.name}:{number}: {exc}")
+        lines = list(iter_ledger_lines(path))
     except OSError as exc:
         warnings.append(f"{path.name}: {exc}")
+        return records
+    for number, offset, raw, terminated in lines:
+        if not raw.strip():
+            continue
+        try:
+            record = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            if not terminated:
+                warn_torn_tail(path, number)
+                continue
+            if is_quarantined_torn_fragment(path, offset, raw):
+                continue
+            warnings.append(f"{path.name}:{number}: {exc}")
+            continue
+        resolved = resolve_pending_record(
+            state_root(), record, warnings, source_path=path
+        )
+        if resolved is not None:
+            records.append(resolved)
     return records
 
 
@@ -1161,62 +1258,57 @@ def persistence_audit_directory(workspace, scope):
     )
 
 
+def load_scoped_ledger_records(kind, directory, schema_version, workspace, scope, warnings, validate_identity=False):
+    def loader(sink):
+        records = []
+        for path in sorted(directory.glob("*.jsonl")) if directory.exists() else []:
+            for record in read_jsonl_records(path, sink):
+                if record.get("schema_version") != schema_version:
+                    sink.append(f"{path.name}: unsupported {kind.replace('_', ' ')} schema")
+                    continue
+                if validate_identity:
+                    if normalized_workspace(record.get("workspace", "")) != normalized_workspace(workspace):
+                        sink.append(f"{path.name}: {kind.replace('_', ' ')} workspace mismatch")
+                        continue
+                    if normalize_scope(record.get("scope")).casefold() != normalize_scope(scope).casefold():
+                        sink.append(f"{path.name}: {kind.replace('_', ' ')} scope mismatch")
+                        continue
+                records.append(record)
+        return records
+
+    return memoized_records(kind, workspace, scope, warnings, loader)
+
+
 def load_evidence_records(workspace, scope, warnings=None):
     warnings = warnings if warnings is not None else []
-    root = evidence_directory(workspace, scope)
-    records = []
-    for path in sorted(root.glob("*.jsonl")) if root.exists() else []:
-        for record in read_jsonl_records(path, warnings):
-            if record.get("schema_version") != EVIDENCE_SCHEMA_VERSION:
-                warnings.append(f"{path.name}: unsupported evidence schema")
-                continue
-            if normalized_workspace(record.get("workspace", "")) != normalized_workspace(workspace):
-                warnings.append(f"{path.name}: evidence workspace mismatch")
-                continue
-            if normalize_scope(record.get("scope")).casefold() != normalize_scope(scope).casefold():
-                warnings.append(f"{path.name}: evidence scope mismatch")
-                continue
-            records.append(record)
-    return records
+    return load_scoped_ledger_records(
+        "evidence", evidence_directory(workspace, scope), EVIDENCE_SCHEMA_VERSION,
+        workspace, scope, warnings, validate_identity=True,
+    )
 
 
 def load_promotion_records(workspace, scope, warnings=None):
     warnings = warnings if warnings is not None else []
-    root = promotion_directory(workspace, scope)
-    records = []
-    for path in sorted(root.glob("*.jsonl")) if root.exists() else []:
-        for record in read_jsonl_records(path, warnings):
-            if record.get("schema_version") != PROMOTION_SCHEMA_VERSION:
-                warnings.append(f"{path.name}: unsupported promotion schema")
-                continue
-            records.append(record)
-    return records
+    return load_scoped_ledger_records(
+        "promotion", promotion_directory(workspace, scope), PROMOTION_SCHEMA_VERSION,
+        workspace, scope, warnings,
+    )
 
 
 def load_evidence_lifecycle_records(workspace, scope, warnings=None):
     warnings = warnings if warnings is not None else []
-    root = evidence_lifecycle_directory(workspace, scope)
-    records = []
-    for path in sorted(root.glob("*.jsonl")) if root.exists() else []:
-        for record in read_jsonl_records(path, warnings):
-            if record.get("schema_version") != EVIDENCE_LIFECYCLE_SCHEMA_VERSION:
-                warnings.append(f"{path.name}: unsupported evidence lifecycle schema")
-                continue
-            records.append(record)
-    return records
+    return load_scoped_ledger_records(
+        "evidence_lifecycle", evidence_lifecycle_directory(workspace, scope),
+        EVIDENCE_LIFECYCLE_SCHEMA_VERSION, workspace, scope, warnings,
+    )
 
 
 def load_persistence_audit_records(workspace, scope, warnings=None):
     warnings = warnings if warnings is not None else []
-    root = persistence_audit_directory(workspace, scope)
-    records = []
-    for path in sorted(root.glob("*.jsonl")) if root.exists() else []:
-        for record in read_jsonl_records(path, warnings):
-            if record.get("schema_version") != PERSISTENCE_AUDIT_SCHEMA_VERSION:
-                warnings.append(f"{path.name}: unsupported persistence audit schema")
-                continue
-            records.append(record)
-    return records
+    return load_scoped_ledger_records(
+        "persistence_audit", persistence_audit_directory(workspace, scope),
+        PERSISTENCE_AUDIT_SCHEMA_VERSION, workspace, scope, warnings,
+    )
 
 
 def evidence_lifecycle_head(evidence, warnings=None):
@@ -1269,17 +1361,53 @@ def evidence_state(evidence, warnings=None):
     }
 
 
-def find_evidence(evidence_id):
-    root = state_root() / "memory" / "evidence" / "workspaces"
-    matches = []
-    if root.exists():
-        for path in root.glob("*/*/*.jsonl"):
-            for record in read_jsonl_records(path, []):
-                if (
-                    record.get("schema_version") == EVIDENCE_SCHEMA_VERSION
+def scoped_lookup_tiers(root, workspace=None, scope=None):
+    """Search paths for an id lookup: scoped, then workspace-wide, then global.
+
+    Ids are UUID-unique, so the first tier that matches is authoritative and
+    the global scan runs only when no hint tier contains the id.
+    """
+
+    tiers = []
+    if workspace is not None and scope is not None:
+        tiers.append((root / workspace_key(workspace) / scope_key(scope), "*.jsonl"))
+    if workspace is not None:
+        tiers.append((root / workspace_key(workspace), "*/*.jsonl"))
+    tiers.append((root, "*/*/*.jsonl"))
+    for tier, pattern in tiers:
+        yield tier, pattern
+
+
+def lookup_memo_key(kind, record_id, workspace=None, scope=None):
+    return (
+        kind,
+        record_id,
+        workspace_key(workspace) if workspace is not None else None,
+        scope_key(scope) if scope is not None else None,
+    )
+
+
+def find_evidence(evidence_id, workspace=None, scope=None):
+    def locate():
+        root = state_root() / "memory" / "evidence" / "workspaces"
+        if root.exists():
+            for tier, pattern in scoped_lookup_tiers(root, workspace, scope):
+                if not tier.exists():
+                    continue
+                matches = [
+                    record
+                    for path in tier.glob(pattern)
+                    for record in read_jsonl_records(path, [])
+                    if record.get("schema_version") == EVIDENCE_SCHEMA_VERSION
                     and record.get("evidence_id") == evidence_id
-                ):
-                    matches.append(record)
+                ]
+                if matches:
+                    return matches
+        return []
+
+    matches = memoized_value(
+        lookup_memo_key("evidence_lookup", evidence_id, workspace, scope), locate
+    )
     if not matches:
         raise FileNotFoundError(f"evidence not found: {evidence_id}")
     if len(matches) > 1:
@@ -1316,10 +1444,9 @@ def codex_sessions_home():
 def conversation_session_candidates(root, thread_id):
     if not root.exists():
         return []
-    candidates = sorted(root.rglob(f"*{thread_id}*.jsonl"))
-    if candidates:
-        return candidates
-    return sorted(root.rglob("*.jsonl"))
+    # resolution requires the thread id in the session filename; never fall
+    # back to line-parsing the entire session corpus
+    return sorted(root.rglob(f"*{thread_id}*.jsonl"))
 
 
 def append_text_parts(parts, value):
@@ -1460,12 +1587,28 @@ def sensitive_material_reason(value):
 
 
 def source_snapshot(source, workspace):
+    memo = _DERIVATION_MEMO.get()
+    if memo is None:
+        return source_snapshot_uncached(source, workspace)
+    key = ("source_snapshot", source, normalized_workspace(workspace))
+    if key not in memo:
+        memo[key] = source_snapshot_uncached(source, workspace)
+    # snapshots are stored into projections and compared by value; copy on
+    # every memo hit so no caller can mutate the shared cached object
+    return copy.deepcopy(memo[key])
+
+
+def has_protected_grounding_prefix(source):
+    return str(source).casefold().startswith(("conversation:", "evidence:"))
+
+
+def source_snapshot_uncached(source, workspace):
     if source.startswith("conversation:"):
         return conversation_turn_snapshot(source)
     if source.startswith("evidence:"):
         evidence_id = source.split(":", 1)[1]
         try:
-            record = find_evidence(evidence_id)
+            record = find_evidence(evidence_id, workspace=workspace)
         except (OSError, ValueError, RuntimeError):
             return {"kind": "conversation_evidence", "ref": source, "exists": False}
         content_hash = hashlib.sha256(
@@ -1500,7 +1643,7 @@ def source_snapshot(source, workspace):
     if source.startswith("memory:"):
         memory_id = source.split(":", 1)[1]
         try:
-            record = find_semantic_memory(memory_id)
+            record = find_semantic_memory(memory_id, workspace=workspace)
         except (OSError, ValueError, RuntimeError):
             return {"kind": "semantic_memory", "ref": source, "exists": False}
         return {
@@ -1568,33 +1711,47 @@ def semantic_source_state(paths):
 
 def load_semantic_entries(workspace, scope, warnings=None):
     warnings = warnings if warnings is not None else []
-    entries = []
-    for path in semantic_paths(workspace, scope):
-        for record in read_jsonl_records(path, warnings):
-            if record.get("schema_version") != SEMANTIC_SCHEMA_VERSION:
-                warnings.append(f"{path.name}: unsupported semantic schema")
-                continue
-            if normalized_workspace(record.get("workspace", "")) != normalized_workspace(workspace):
-                warnings.append(f"{path.name}: workspace mismatch")
-                continue
-            if normalize_scope(record.get("scope")).casefold() != normalize_scope(scope).casefold():
-                warnings.append(f"{path.name}: scope mismatch")
-                continue
-            entries.append(record)
-    return entries
+
+    def loader(sink):
+        entries = []
+        for path in semantic_paths(workspace, scope):
+            for record in read_jsonl_records(path, sink):
+                if record.get("schema_version") != SEMANTIC_SCHEMA_VERSION:
+                    sink.append(f"{path.name}: unsupported semantic schema")
+                    continue
+                if normalized_workspace(record.get("workspace", "")) != normalized_workspace(workspace):
+                    sink.append(f"{path.name}: workspace mismatch")
+                    continue
+                if normalize_scope(record.get("scope")).casefold() != normalize_scope(scope).casefold():
+                    sink.append(f"{path.name}: scope mismatch")
+                    continue
+                entries.append(record)
+        return entries
+
+    return memoized_records("semantic_entries", workspace, scope, warnings, loader)
 
 
-def find_semantic_memory(memory_id):
-    root = state_root() / "memory" / "semantic" / "workspaces"
-    matches = []
-    if root.exists():
-        for path in root.glob("*/*/*.jsonl"):
-            matches.extend(
-                record
-                for record in read_jsonl_records(path, [])
-                if record.get("schema_version") == SEMANTIC_SCHEMA_VERSION
-                and record.get("memory_id") == memory_id
-            )
+def find_semantic_memory(memory_id, workspace=None, scope=None):
+    def locate():
+        root = state_root() / "memory" / "semantic" / "workspaces"
+        if root.exists():
+            for tier, pattern in scoped_lookup_tiers(root, workspace, scope):
+                if not tier.exists():
+                    continue
+                matches = [
+                    record
+                    for path in tier.glob(pattern)
+                    for record in read_jsonl_records(path, [])
+                    if record.get("schema_version") == SEMANTIC_SCHEMA_VERSION
+                    and record.get("memory_id") == memory_id
+                ]
+                if matches:
+                    return matches
+        return []
+
+    matches = memoized_value(
+        lookup_memo_key("semantic_memory_lookup", memory_id, workspace, scope), locate
+    )
     if not matches:
         raise FileNotFoundError(f"semantic memory not found: {memory_id}")
     if len(matches) > 1:
@@ -1615,16 +1772,20 @@ def semantic_disposition_directory(workspace, scope):
 
 def load_semantic_dispositions(workspace, scope, warnings=None):
     warnings = warnings if warnings is not None else []
-    root = semantic_disposition_directory(workspace, scope)
-    records = []
-    if root.exists():
-        for path in sorted(root.glob("*.jsonl")):
-            for record in read_jsonl_records(path, warnings):
-                if record.get("schema_version") == SEMANTIC_DISPOSITION_SCHEMA_VERSION:
-                    records.append(record)
-                else:
-                    warnings.append(f"{path.name}: unsupported semantic disposition schema")
-    return records
+
+    def loader(sink):
+        root = semantic_disposition_directory(workspace, scope)
+        records = []
+        if root.exists():
+            for path in sorted(root.glob("*.jsonl")):
+                for record in read_jsonl_records(path, sink):
+                    if record.get("schema_version") == SEMANTIC_DISPOSITION_SCHEMA_VERSION:
+                        records.append(record)
+                    else:
+                        sink.append(f"{path.name}: unsupported semantic disposition schema")
+        return records
+
+    return memoized_records("semantic_dispositions", workspace, scope, warnings, loader)
 
 
 def semantic_disposition_heads(workspace, scope, warnings=None):
@@ -1655,23 +1816,77 @@ def active_semantic_entries(entries, workspace=None, scope=None, warnings=None):
         evidence_id = entry.get("promotion", {}).get("evidence_id")
         if evidence_id:
             try:
-                evidence = find_evidence(evidence_id)
+                evidence = find_evidence(
+                    evidence_id, workspace=entry.get("workspace"), scope=entry.get("scope")
+                )
                 if evidence_state(evidence)["state"] != "PROMOTED":
                     continue
             except (OSError, ValueError, RuntimeError):
                 continue
-        active.append(entry)
-    return active
+        if entry.get("reorganization") and reorganization_evidence_terminal(entry):
+            continue
+        active.append(dict(entry))
+    return mark_contested_semantic_entries(active)
+
+
+def mark_contested_semantic_entries(entries):
+    active_ids = {entry.get("memory_id") for entry in entries}
+    contested = {memory_id: set() for memory_id in active_ids}
+    for entry in entries:
+        source_id = entry.get("memory_id")
+        for target_id in entry.get("conflicts_with", []):
+            if target_id not in active_ids:
+                continue
+            contested[source_id].add(target_id)
+            contested[target_id].add(source_id)
+    for entry in entries:
+        contested_with = sorted(contested.get(entry.get("memory_id"), set()))
+        if contested_with:
+            entry["contested_with"] = contested_with
+    return entries
+
+
+def reorganization_evidence_terminal(entry):
+    """A merged/split entry dies with any inherited terminal evidence source.
+
+    Reorganization inherits evidence refs from its inputs instead of passing
+    the Promotion Gate again; the lifecycle dependency must therefore be
+    checked here exactly as it is for promotion-backed entries.
+    """
+
+    terminal_states = {state.upper() for state in EVIDENCE_TERMINAL_STATES}
+    for source in entry.get("sources", []):
+        if not source.startswith("evidence:"):
+            continue
+        try:
+            evidence = find_evidence(
+                source.split(":", 1)[1],
+                workspace=entry.get("workspace"),
+                scope=entry.get("scope"),
+            )
+        except (OSError, ValueError, RuntimeError):
+            return True
+        if evidence_state(evidence)["state"] in terminal_states:
+            return True
+    return False
 
 
 def semantic_evidence_dependency_state(entries):
     state = {}
+    dependency_ids = {}
     for entry in entries:
         evidence_id = entry.get("promotion", {}).get("evidence_id")
-        if not evidence_id:
-            continue
+        if evidence_id:
+            dependency_ids.setdefault(evidence_id, entry)
+        if entry.get("reorganization"):
+            for source in entry.get("sources", []):
+                if source.startswith("evidence:"):
+                    dependency_ids.setdefault(source.split(":", 1)[1], entry)
+    for evidence_id, entry in dependency_ids.items():
         try:
-            evidence = find_evidence(evidence_id)
+            evidence = find_evidence(
+                evidence_id, workspace=entry.get("workspace"), scope=entry.get("scope")
+            )
             lifecycle = evidence_state(evidence)
             state[evidence_id] = {
                 "state": lifecycle["state"],
@@ -1704,6 +1919,7 @@ def semantic_index_path(workspace, scope):
     )
 
 
+@memoized_derivation
 def build_semantic_index_value(workspace, scope, warnings=None):
     warnings = warnings if warnings is not None else []
     paths = semantic_paths(workspace, scope)
@@ -1764,6 +1980,7 @@ def load_semantic_index(workspace, scope):
     return index
 
 
+@memoized_derivation
 def semantic_index_is_fresh(index, workspace, scope):
     if not index or index.get("source_state") != semantic_source_state(
         semantic_paths(workspace, scope)
@@ -1782,6 +1999,133 @@ def semantic_index_is_fresh(index, workspace, scope):
     )
 
 
+SEMANTIC_BUDGET_SCHEMA_VERSION = "weilan_semantic_budget_v0.1"
+DEFAULT_SEMANTIC_BUDGET = 100
+PROTECTED_SEMANTIC_KINDS = {"constraint", "open_question"}
+
+
+def semantic_budget_path(workspace, scope):
+    return (
+        state_root() / "memory" / "semantic-budgets" / "workspaces"
+        / workspace_key(workspace) / f"{scope_key(scope)}.jsonl"
+    )
+
+
+def load_semantic_budget_records(workspace, scope):
+    """Strict loader for the binding budget ledger: corruption fails closed.
+
+    A binding budget must never fall back to a default or a stale head because
+    its ledger is unreadable; every admission this budget guards would then be
+    running on invented authority. Torn tails from interrupted appends are
+    still healed by the durability layer; anything else rejects.
+    """
+
+    path = semantic_budget_path(workspace, scope)
+    if not path.exists():
+        return []
+    warnings = []
+    records = read_jsonl_records(path, warnings)
+    if warnings:
+        raise ValueError(
+            "semantic budget ledger is invalid: " + "; ".join(warnings)
+            + f"; admission stays closed until {path} is restored or quarantined"
+        )
+    for index, record in enumerate(records, 1):
+        label = f"semantic budget record {index}"
+        if record.get("schema_version") != SEMANTIC_BUDGET_SCHEMA_VERSION:
+            raise ValueError(f"{label}: unsupported schema_version")
+        if normalized_workspace(record.get("workspace", "")) != normalized_workspace(workspace):
+            raise ValueError(f"{label}: workspace mismatch")
+        if normalize_scope(record.get("scope")).casefold() != normalize_scope(scope).casefold():
+            raise ValueError(f"{label}: scope mismatch")
+        max_active = record.get("max_active")
+        if not isinstance(max_active, int) or isinstance(max_active, bool) or max_active < 1:
+            raise ValueError(f"{label}: max_active must be a positive integer")
+    return records
+
+
+def semantic_budget_head(workspace, scope):
+    records = load_semantic_budget_records(workspace, scope)
+    return records[-1] if records else None
+
+
+def semantic_budget(workspace, scope):
+    head = semantic_budget_head(workspace, scope)
+    if head is not None:
+        return int(head["max_active"])
+    return int(os.environ.get("WEILAN_SEMANTIC_BUDGET_DEFAULT", DEFAULT_SEMANTIC_BUDGET))
+
+
+def semantic_entry_protected(entry):
+    return entry.get("kind") in PROTECTED_SEMANTIC_KINDS or "critical" in entry.get("tags", [])
+
+
+def enforce_semantic_budget(workspace, scope, incoming, displace, leaving_ids=(), warnings=None):
+    """Zero-sum admission for the active semantic set (Memory 0.8 conservation).
+
+    The active recall set is the scope's existence budget: once it is full, a
+    new durable entry must name what it displaces. Displacement is an explicit
+    dormant disposition (reversible), never deletion. Entries that this same
+    write supersedes are counted as leaving, so a correction or merge at full
+    budget needs no displacement.
+    """
+
+    warnings = warnings if warnings is not None else []
+    budget = semantic_budget(workspace, scope)
+    active = active_semantic_entries(
+        load_semantic_entries(workspace, scope, warnings), workspace, scope, warnings
+    )
+    active_ids = {entry["memory_id"] for entry in active}
+    displaced = list(dict.fromkeys(displace or []))
+    for memory_id in displaced:
+        if memory_id not in active_ids:
+            raise ValueError(f"displacement target is not an active semantic memory: {memory_id}")
+    leaving = {memory_id for memory_id in leaving_ids if memory_id in active_ids}
+    projected = len(active) - len(leaving) - len(displaced) + incoming
+    if projected > budget:
+        remaining = [
+            entry for entry in active
+            if entry["memory_id"] not in leaving and entry["memory_id"] not in set(displaced)
+        ]
+        candidates = [entry for entry in remaining if not semantic_entry_protected(entry)][:5]
+        listing = "; ".join(
+            "{} ({}: {})".format(entry["memory_id"], entry["kind"], entry["summary"][:48])
+            for entry in candidates
+        ) or "none - only protected entries remain; retire or split one explicitly"
+        raise ValueError(
+            "semantic budget exhausted: "
+            f"active={len(active)}, incoming={incoming}, leaving={len(leaving)}, "
+            f"displaced={len(displaced)}, max_active={budget}. "
+            "Name --displace <memory-id> (dormant, reversible), merge redundant entries, "
+            "or raise the budget with memory-budget-set. Oldest unprotected candidates: "
+            + listing
+        )
+    return displaced
+
+
+def append_displacement_dispositions(workspace, scope, displaced_ids, new_memory_id):
+    event_ids = []
+    for memory_id in displaced_ids:
+        event = {
+            "schema_version": SEMANTIC_DISPOSITION_SCHEMA_VERSION,
+            "event_id": str(uuid.uuid4()),
+            "timestamp_utc": utc_now(),
+            "authority": "explicit_semantic_retention_control_never_activation_authority",
+            "workspace": workspace,
+            "workspace_key": workspace_key(workspace),
+            "scope": scope,
+            "scope_key": scope_key(scope),
+            "memory_id": memory_id,
+            "state": "dormant",
+            "reason": f"displaced_by_budget:{new_memory_id}",
+            "source": f"memory:{new_memory_id}",
+        }
+        date_dir = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        append_event(semantic_disposition_directory(workspace, scope) / f"{date_dir}.jsonl", event)
+        event_ids.append(event["event_id"])
+    return event_ids
+
+
 def append_semantic_memory(
     workspace,
     scope,
@@ -1793,12 +2137,21 @@ def append_semantic_memory(
     supersedes,
     conflicts_with=None,
     promotion=None,
+    reorganization=None,
+    displace=None,
+    enforce_budget=True,
 ):
     workspace = canonical_workspace(workspace)
     scope = normalize_scope(scope)
     if not summary.strip():
         raise ValueError("semantic summary cannot be empty")
     warnings = []
+    if enforce_budget:
+        displaced = enforce_semantic_budget(
+            workspace, scope, 1, displace, leaving_ids=supersedes, warnings=warnings
+        )
+    else:
+        displaced = list(dict.fromkeys(displace or []))
     existing = load_semantic_entries(workspace, scope, warnings)
     existing_ids = {entry.get("memory_id") for entry in existing}
     unknown = sorted(set(supersedes) - existing_ids)
@@ -1832,6 +2185,8 @@ def append_semantic_memory(
     }
     if promotion:
         entry["promotion"] = promotion
+    if reorganization:
+        entry["reorganization"] = reorganization
     encoded = json.dumps(entry, ensure_ascii=False, sort_keys=True).encode("utf-8")
     if len(encoded) > MAX_SEMANTIC_ENTRY_BYTES:
         raise ValueError(f"semantic entry exceeds {MAX_SEMANTIC_ENTRY_BYTES} bytes")
@@ -1846,6 +2201,9 @@ def append_semantic_memory(
         / f"{date_dir}.jsonl"
     )
     append_event(path, entry)
+    displacement_events = append_displacement_dispositions(
+        workspace, scope, displaced, entry["memory_id"]
+    )
     index = rebuild_semantic_index(workspace, scope, warnings)
     result = {
         "saved": True,
@@ -1855,6 +2213,8 @@ def append_semantic_memory(
         "path": str(path),
         "index_path": str(semantic_index_path(workspace, scope)),
         "active_entry_count": index["active_entry_count"],
+        "displaced": displaced,
+        "displacement_event_ids": displacement_events,
     }
     if warnings:
         result["warnings"] = warnings
@@ -1864,24 +2224,223 @@ def append_semantic_memory(
 def command_memory_consolidate(args):
     prohibited = [
         source for source in args.source
-        if source.startswith("conversation:") or source.startswith("evidence:")
+        if has_protected_grounding_prefix(source)
     ]
     if prohibited:
         raise ValueError(
             "conversation-derived semantic memory must pass evidence-capture and evidence-promote"
         )
-    result, _ = append_semantic_memory(
-        args.workspace,
-        args.scope,
-        args.kind,
-        args.summary,
-        args.detail,
-        args.tag,
-        args.source,
-        args.supersedes,
-        args.conflicts_with,
-    )
+    workspace = canonical_workspace(args.workspace)
+    scope = normalize_scope(args.scope)
+    with contract_fence(
+        state_root(), workspace_key(workspace), scope_key(scope)
+    ):
+        result, _ = append_semantic_memory(
+            workspace,
+            scope,
+            args.kind,
+            args.summary,
+            args.detail,
+            args.tag,
+            args.source,
+            args.supersedes,
+            args.conflicts_with,
+            displace=getattr(args, "displace", []),
+        )
     print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def semantic_reorganization_grounding(candidate_text, input_entries):
+    input_tokens = set()
+    for entry in input_entries:
+        input_tokens.update(semantic_tokens(
+            " ".join([entry.get("summary", ""), entry.get("detail", "")])
+        ))
+    return bool(set(semantic_tokens(candidate_text)).intersection(input_tokens))
+
+
+def command_memory_merge(args):
+    prohibited = [
+        source for source in args.source
+        if has_protected_grounding_prefix(source)
+    ]
+    if prohibited:
+        raise ValueError(
+            "memory-merge may inherit conversation/evidence grounding from inputs, "
+            "but explicit --source conversation:/evidence: injection must pass the "
+            "evidence promotion path first"
+        )
+    workspace = canonical_workspace(args.workspace)
+    scope = normalize_scope(args.scope)
+    from_ids = list(dict.fromkeys(args.from_id))
+    if len(from_ids) < 2:
+        raise ValueError("memory-merge requires at least two distinct --from ids")
+    with contract_fence(state_root(), workspace_key(workspace), scope_key(scope)):
+        warnings = []
+        active = active_semantic_entries(
+            load_semantic_entries(workspace, scope, warnings), workspace, scope, warnings
+        )
+        by_id = {entry["memory_id"]: entry for entry in active}
+        missing = [memory_id for memory_id in from_ids if memory_id not in by_id]
+        if missing:
+            raise ValueError(
+                "merge inputs must be active semantic memories: " + ", ".join(missing)
+            )
+        inputs = [by_id[memory_id] for memory_id in from_ids]
+        if not semantic_reorganization_grounding(args.summary, inputs):
+            raise ValueError(
+                "merged summary has no lexical grounding in the input entries"
+            )
+        sources = list(dict.fromkeys(
+            [source for entry in inputs for source in entry.get("sources", [])]
+            + list(args.source)
+        ))
+        tags = sorted({tag for entry in inputs for tag in entry.get("tags", [])}
+                      | {tag.strip().casefold() for tag in args.tag if tag.strip()})
+        conflicts = sorted({
+            conflict
+            for entry in inputs
+            for conflict in entry.get("conflicts_with", [])
+            if conflict not in set(from_ids)
+        })
+        displaced = enforce_semantic_budget(
+            workspace, scope, 1, args.displace, leaving_ids=from_ids, warnings=warnings
+        )
+        result, entry = append_semantic_memory(
+            workspace,
+            scope,
+            args.kind,
+            args.summary,
+            args.detail,
+            tags,
+            sources,
+            from_ids,
+            conflicts,
+            reorganization={"kind": "merge", "from": from_ids},
+            displace=displaced,
+            enforce_budget=False,
+        )
+    result["reorganization"] = entry["reorganization"]
+    result["merged_from"] = from_ids
+    if warnings:
+        result["warnings"] = result.get("warnings", []) + warnings
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def parse_split_part(raw, index):
+    try:
+        part = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--part {index} is not a JSON object: {exc}") from exc
+    if not isinstance(part, dict) or not str(part.get("summary", "")).strip():
+        raise ValueError(f"--part {index} requires an object with a non-empty summary")
+    kind = part.get("kind")
+    if kind is not None and kind not in SEMANTIC_KINDS:
+        raise ValueError(f"--part {index} kind must be one of {', '.join(SEMANTIC_KINDS)}")
+    tags = part.get("tags", [])
+    if not isinstance(tags, list):
+        raise ValueError(f"--part {index} tags must be a list")
+    return {
+        "kind": kind,
+        "summary": str(part["summary"]).strip(),
+        "detail": str(part.get("detail", "")),
+        "tags": [str(tag) for tag in tags],
+    }
+
+
+def command_memory_split(args):
+    workspace = canonical_workspace(args.workspace)
+    scope = normalize_scope(args.scope)
+    parts = [parse_split_part(raw, index) for index, raw in enumerate(args.part, 1)]
+    if len(parts) < 2:
+        raise ValueError("memory-split requires at least two --part objects")
+    with contract_fence(state_root(), workspace_key(workspace), scope_key(scope)):
+        warnings = []
+        active = active_semantic_entries(
+            load_semantic_entries(workspace, scope, warnings), workspace, scope, warnings
+        )
+        by_id = {entry["memory_id"]: entry for entry in active}
+        parent = by_id.get(args.memory_id)
+        if parent is None:
+            raise ValueError(
+                f"split target must be an active semantic memory: {args.memory_id}"
+            )
+        for index, part in enumerate(parts, 1):
+            if not semantic_reorganization_grounding(
+                " ".join([part["summary"], part["detail"]]), [parent]
+            ):
+                raise ValueError(
+                    f"--part {index} has no lexical grounding in the split target"
+                )
+        displaced = enforce_semantic_budget(
+            workspace, scope, len(parts), args.displace,
+            leaving_ids=[args.memory_id], warnings=warnings,
+        )
+        created = []
+        reorganization = {"kind": "split", "from": [args.memory_id], "part_count": len(parts)}
+        for index, part in enumerate(parts, 1):
+            # only the final part supersedes the parent, so an interrupted
+            # split never deactivates the parent before every part is durable
+            is_last = index == len(parts)
+            result, entry = append_semantic_memory(
+                workspace,
+                scope,
+                part["kind"] or parent.get("kind"),
+                part["summary"],
+                part["detail"],
+                part["tags"],
+                parent.get("sources", []),
+                [args.memory_id] if is_last else [],
+                [],
+                reorganization={**reorganization, "part": index},
+                displace=displaced if is_last else [],
+                enforce_budget=False,
+            )
+            created.append({"memory_id": entry["memory_id"], "summary": part["summary"]})
+    output = {
+        "saved": True,
+        "split_from": args.memory_id,
+        "created": created,
+        "displaced": displaced,
+        "active_entry_count": result["active_entry_count"],
+    }
+    if warnings:
+        output["warnings"] = warnings
+    print(json.dumps(output, ensure_ascii=False, indent=2))
+
+
+def command_memory_budget_set(args):
+    workspace = canonical_workspace(args.workspace)
+    scope = normalize_scope(args.scope)
+    if args.max_active < 1:
+        raise ValueError("--max-active must be a positive integer")
+    if not args.reason.strip():
+        raise ValueError("--reason cannot be empty")
+    with contract_fence(state_root(), workspace_key(workspace), scope_key(scope)):
+        previous = semantic_budget(workspace, scope)
+        event = {
+            "schema_version": SEMANTIC_BUDGET_SCHEMA_VERSION,
+            "event_id": str(uuid.uuid4()),
+            "timestamp_utc": utc_now(),
+            "authority": "explicit_semantic_budget_control_never_activation_authority",
+            "workspace": workspace,
+            "workspace_key": workspace_key(workspace),
+            "scope": scope,
+            "scope_key": scope_key(scope),
+            "max_active": args.max_active,
+            "previous_max_active": previous,
+            "reason": args.reason.strip(),
+        }
+        append_event(semantic_budget_path(workspace, scope), event)
+    print(json.dumps({
+        "saved": True,
+        "event_id": event["event_id"],
+        "workspace": workspace,
+        "scope": scope,
+        "max_active": args.max_active,
+        "previous_max_active": previous,
+        "history_preserved": True,
+    }, ensure_ascii=False, indent=2))
 
 
 def command_evidence_capture(args):
@@ -2006,6 +2565,210 @@ def command_evidence_capture(args):
     )
 
 
+def memory_note_reject(reason_codes):
+    print(
+        json.dumps(
+            {
+                "saved": False,
+                "promoted": False,
+                "decision": "REJECTED",
+                "reason_codes": reason_codes,
+                "semantic_memory_written": False,
+                "evidence_written": False,
+                "audit_written": False,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+def command_memory_note(args):
+    workspace = canonical_workspace(args.workspace)
+    scope = normalize_scope(args.scope)
+    with contract_fence(state_root(), workspace_key(workspace), scope_key(scope)):
+        return command_memory_note_fenced(args, workspace, scope)
+
+
+def command_memory_note_fenced(args, workspace, scope):
+    claim = args.claim.strip()
+    sources = list(dict.fromkeys(args.source))
+    if len(sources) != 1:
+        raise ValueError("memory-note v0.1 supports exactly one conversation source")
+    if args.signal not in PERSISTABLE_EVIDENCE_SIGNALS:
+        memory_note_reject(["non_durable_conversation_signal"])
+        return
+    if not claim:
+        raise ValueError("--claim cannot be empty")
+    conversation_sources = [source for source in sources if valid_conversation_source(source)]
+    if not conversation_sources:
+        raise ValueError(
+            "conversation evidence requires --source conversation:<thread-id>#<exact-turn-id>"
+        )
+    if len(claim.splitlines()) > 6:
+        memory_note_reject(["claim_exceeds_six_line_fragment_boundary"])
+        return
+    sensitive_reason = sensitive_material_reason(
+        "\n".join([claim, *sources, *args.tag])
+    )
+    if sensitive_reason:
+        memory_note_reject([sensitive_reason])
+        return
+    unresolved = [
+        snapshot
+        for snapshot in (conversation_turn_snapshot(source) for source in conversation_sources)
+        if snapshot.get("kind") == "conversation_turn" and not snapshot.get("exists")
+    ]
+    if unresolved:
+        reasons = sorted({snapshot.get("reason", "not_found") for snapshot in unresolved})
+        raise ValueError(
+            "conversation turn provenance is not resolvable: " + ", ".join(reasons)
+        )
+
+    evidence_id = str(uuid.uuid4())
+    evidence_entry = {
+        "schema_version": EVIDENCE_SCHEMA_VERSION,
+        "evidence_id": evidence_id,
+        "timestamp_utc": utc_now(),
+        "authority": "conversation_evidence_never_semantic_or_activation_authority",
+        "workspace": workspace,
+        "workspace_key": workspace_key(workspace),
+        "scope": scope,
+        "scope_key": scope_key(scope),
+        "signal": args.signal,
+        "claim": claim,
+        "claim_hash": hashlib.sha256(claim.encode("utf-8")).hexdigest(),
+        "tags": sorted({tag.strip().casefold() for tag in args.tag if tag.strip()}),
+        "sources": sources,
+        "source_snapshots": source_snapshots(sources, workspace),
+        "privacy_scan": "passed_automated_pattern_check",
+    }
+    encoded = json.dumps(evidence_entry, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    if len(encoded) > MAX_EVIDENCE_BYTES:
+        memory_note_reject(["evidence_fragment_exceeds_4096_bytes"])
+        return
+
+    warnings = []
+    reasons = []
+    if not args.stable:
+        reasons.append("stability_not_confirmed")
+    if not args.reusable:
+        reasons.append("cross_task_reuse_not_confirmed")
+    if not args.privacy_reviewed:
+        reasons.append("privacy_review_not_confirmed")
+    allowed_kinds = PROMOTABLE_KINDS_BY_SIGNAL.get(evidence_entry.get("signal"), set())
+    if args.kind not in allowed_kinds:
+        reasons.append("semantic_kind_not_allowed_for_signal")
+    if not args.summary.strip():
+        reasons.append("semantic_summary_empty")
+    if sensitive_material_reason(
+        "\n".join([args.summary, args.detail, *args.tag, *sources])
+    ):
+        reasons.append("semantic_content_failed_sensitive_material_check")
+    current_sources = source_snapshots(evidence_entry.get("sources", []), workspace)
+    if current_sources != evidence_entry.get("source_snapshots", []):
+        reasons.append("evidence_sources_stale")
+    claim_tokens = set(semantic_tokens(evidence_entry.get("claim", "")))
+    summary_tokens = set(semantic_tokens(args.summary))
+    if not claim_tokens.intersection(summary_tokens):
+        reasons.append("semantic_summary_not_grounded_in_evidence_claim")
+    displaced = []
+    budget_detail = None
+    if not reasons:
+        try:
+            displaced = enforce_semantic_budget(
+                workspace, scope, 1, [], warnings=warnings
+            )
+        except ValueError as exc:
+            reasons.append("semantic_budget_exhausted")
+            budget_detail = str(exc)
+    if reasons:
+        result = {
+            "saved": False,
+            "promoted": False,
+            "decision": "REJECTED",
+            "reason_codes": reasons,
+            "semantic_memory_written": False,
+            "evidence_written": False,
+            "audit_written": False,
+        }
+        if budget_detail:
+            result["budget_detail"] = budget_detail
+        if warnings:
+            result["warnings"] = warnings
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    promotion_id = str(uuid.uuid4())
+    summary_hash = hashlib.sha256(args.summary.strip().encode("utf-8")).hexdigest()
+    promotion_record = {
+        "schema_version": PROMOTION_SCHEMA_VERSION,
+        "promotion_id": promotion_id,
+        "timestamp_utc": utc_now(),
+        "workspace": workspace,
+        "workspace_key": workspace_key(workspace),
+        "scope": scope,
+        "scope_key": scope_key(scope),
+        "evidence_id": evidence_id,
+        "requested_kind": args.kind,
+        "summary_hash": summary_hash,
+        "gate_checks": {
+            "source_backed": bool(evidence_entry.get("sources")),
+            "sources_fresh": current_sources == evidence_entry.get("source_snapshots", []),
+            "stable": bool(args.stable),
+            "reusable": bool(args.reusable),
+            "privacy_reviewed": bool(args.privacy_reviewed),
+            "signal_kind_allowed": args.kind in allowed_kinds,
+            "claim_summary_overlap": bool(claim_tokens.intersection(summary_tokens)),
+        },
+        "reason_codes": [],
+        "authority": "promotion_audit_never_activation_authority",
+    }
+
+    evidence_path = evidence_directory(workspace, scope) / f"{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.jsonl"
+    append_event(evidence_path, evidence_entry)
+    semantic_result, semantic_entry = append_semantic_memory(
+        workspace,
+        scope,
+        args.kind,
+        args.summary,
+        args.detail,
+        args.tag,
+        [f"evidence:{evidence_id}", *sources],
+        [],
+        [],
+        displace=displaced,
+        enforce_budget=False,
+        promotion={
+            "schema_version": PROMOTION_SCHEMA_VERSION,
+            "promotion_id": promotion_id,
+            "evidence_id": evidence_id,
+        },
+    )
+    promotion_record["decision"] = "PROMOTED"
+    promotion_record["semantic_memory_id"] = semantic_entry["memory_id"]
+    audit_path = append_promotion_record(workspace, scope, promotion_record)
+    rebuilt_index = rebuild_semantic_index(workspace, scope, warnings)
+    result = {
+        "saved": True,
+        "promoted": True,
+        "decision": "PROMOTED",
+        "evidence_id": evidence_id,
+        "promotion_id": promotion_id,
+        "semantic_memory_id": semantic_entry["memory_id"],
+        "semantic_memory_written": True,
+        "evidence_written": True,
+        "audit_written": True,
+        "evidence_path": str(evidence_path),
+        "audit_path": str(audit_path),
+        "index_path": semantic_result["index_path"],
+        "active_semantic_entry_count": rebuilt_index["active_entry_count"],
+    }
+    if warnings or semantic_result.get("warnings"):
+        result["warnings"] = warnings + semantic_result.get("warnings", [])
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
 def append_promotion_record(workspace, scope, record):
     date_dir = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     path = promotion_directory(workspace, scope) / f"{date_dir}.jsonl"
@@ -2016,6 +2779,13 @@ def append_promotion_record(workspace, scope, record):
 def command_evidence_promote(args):
     workspace = canonical_workspace(args.workspace)
     scope = normalize_scope(args.scope)
+    with contract_fence(
+        state_root(), workspace_key(workspace), scope_key(scope)
+    ):
+        return command_evidence_promote_fenced(args, workspace, scope)
+
+
+def command_evidence_promote_fenced(args, workspace, scope):
     warnings = []
     evidence_matches = [
         record
@@ -2066,6 +2836,16 @@ def command_evidence_promote(args):
     summary_tokens = set(semantic_tokens(args.summary))
     if not claim_tokens.intersection(summary_tokens):
         reasons.append("semantic_summary_not_grounded_in_evidence_claim")
+    displaced = []
+    budget_detail = None
+    if not reasons:
+        try:
+            displaced = enforce_semantic_budget(
+                workspace, scope, 1, getattr(args, "displace", []), warnings=warnings
+            )
+        except ValueError as exc:
+            reasons.append("semantic_budget_exhausted")
+            budget_detail = str(exc)
 
     promotion_id = str(uuid.uuid4())
     now = utc_now()
@@ -2105,6 +2885,8 @@ def command_evidence_promote(args):
             "semantic_memory_written": False,
             "audit_path": str(path),
         }
+        if budget_detail:
+            result["budget_detail"] = budget_detail
         if warnings:
             result["warnings"] = warnings
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -2121,6 +2903,8 @@ def command_evidence_promote(args):
         sources,
         args.supersedes,
         args.conflicts_with,
+        displace=displaced,
+        enforce_budget=False,
         promotion={
             "schema_version": PROMOTION_SCHEMA_VERSION,
             "promotion_id": promotion_id,
@@ -2367,6 +3151,7 @@ def command_persistence_audit_show(args):
     return 1 if warnings else 0
 
 
+@memoized_derivation
 def command_evidence_show(args):
     workspace = canonical_workspace(args.workspace)
     scope = normalize_scope(args.scope)
@@ -2396,10 +3181,18 @@ def command_evidence_show(args):
             item["semantic_memory_id"] = promotion.get("semantic_memory_id")
             item["promotion_id"] = promotion.get("promotion_id")
         results.append(item)
+    total = len(results)
+    limit = getattr(args, "limit", 20)
+    if limit and total > limit:
+        results = sorted(
+            results, key=lambda item: item.get("timestamp_utc", ""), reverse=True
+        )[:limit]
     output = {
         "workspace": workspace,
         "scope": scope,
-        "evidence_count": len(results),
+        "evidence_count": total,
+        "returned_count": len(results),
+        "truncated": len(results) < total,
         "results": results,
         "promotion_audit_count": len(promotions),
         "authority": "evidence_and_promotion_status_never_activation_authority",
@@ -2620,12 +3413,26 @@ def command_prospective_show(args):
     scope = normalize_scope(args.scope)
     warnings = []
     records, state = reduce_prospective(workspace, scope, warnings)
+    causal_events = state["causal_events"]
+    total_events = len(causal_events)
+    limit = getattr(args, "limit", 20)
+    truncated = False
+    if limit and total_events > limit:
+        newest = sorted(
+            causal_events.items(),
+            key=lambda item: item[1].get("observed_at_utc", ""),
+            reverse=True,
+        )[:limit]
+        causal_events = dict(newest)
+        truncated = True
     print(json.dumps({
         "workspace": workspace,
         "scope": scope,
         "record_count": len(records),
         "goals": state["goals"],
-        "causal_events": state["causal_events"],
+        "causal_events": causal_events,
+        "causal_event_count": total_events,
+        "causal_events_truncated": truncated,
         "issues": state["issues"],
         "warnings": warnings,
         "authority": "prospective_state_never_activation_or_action_authority",
@@ -2672,6 +3479,7 @@ def governance_snapshots_fresh(stored_snapshots, workspace):
     return all(snapshot.get("exists", True) for snapshot in current)
 
 
+@memoized_derivation
 def reduce_governance(workspace, scope, warnings=None):
     workspace = canonical_workspace(workspace)
     scope = normalize_scope(scope)
@@ -2703,7 +3511,7 @@ def governance_evidence_refs(refs, workspace, scope=None):
     snapshots = source_snapshots(unique, workspace)
     for ref, snapshot in zip(unique, snapshots):
         if ref.startswith("evidence:"):
-            evidence = find_evidence(ref.split(":", 1)[1])
+            evidence = find_evidence(ref.split(":", 1)[1], workspace=workspace, scope=scope)
             if normalized_workspace(evidence.get("workspace", "")) != normalized_workspace(workspace):
                 raise ValueError(f"evidence belongs to another workspace: {ref}")
             if scope and normalize_scope(evidence.get("scope")).casefold() != normalize_scope(scope).casefold():
@@ -2729,7 +3537,7 @@ def governance_high_scale_authorized(workspace, scope, evidence_refs, audit_id=N
     for ref in evidence_refs:
         if not ref.startswith("evidence:"):
             continue
-        evidence = find_evidence(ref.split(":", 1)[1])
+        evidence = find_evidence(ref.split(":", 1)[1], workspace=workspace, scope=scope)
         if (
             normalized_workspace(evidence.get("workspace", "")) == normalized_workspace(workspace)
             and normalize_scope(evidence.get("scope")).casefold() == normalize_scope(scope).casefold()
@@ -2745,6 +3553,7 @@ def governance_high_scale_authorized(workspace, scope, evidence_refs, audit_id=N
     return False
 
 
+@memoized_derivation
 def append_governance_event(workspace, scope, event_type, data):
     workspace = canonical_workspace(workspace)
     scope = normalize_scope(scope)
@@ -2772,9 +3581,6 @@ def append_governance_event(workspace, scope, event_type, data):
                 "event_type": event_type,
                 "data": data,
             }
-            date_dir = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            path = governance_directory(workspace, scope) / f"{date_dir}.jsonl"
-            append_event(path, event)
             updated_state = reduce_governance_events(
                 records + [event],
                 lambda snapshots: governance_snapshots_fresh(snapshots, workspace),
@@ -2783,6 +3589,9 @@ def append_governance_event(workspace, scope, event_type, data):
                 raise RuntimeError(
                     "governance event produced invalid replay: " + "; ".join(updated_state["issues"])
                 )
+            date_dir = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            path = governance_directory(workspace, scope) / f"{date_dir}.jsonl"
+            append_event(path, event)
             return event, updated_state, path
 
 
@@ -3108,6 +3917,305 @@ def command_governance_target_transition(args):
     )
 
 
+def collapse_trace_registry(workspace, scope):
+    """Collect collapse traces from frame episodes and governance targets.
+
+    Traces are the weak constraints the theory preserves across collapse; this
+    registry is how a new candidate can be checked against every declared
+    forbidden assumption in the scope, from both planes.
+    """
+
+    workspace = canonical_workspace(workspace)
+    scope = normalize_scope(scope)
+    registry = []
+    index = load_episode_index(workspace, scope)
+    if not episode_index_is_fresh(index, workspace, scope):
+        index = build_episode_index_value(workspace, scope)
+    for episode in index.get("episodes", []):
+        for trace in episode.get("traces", []):
+            assumption = str(trace.get("forbidden_assumption", "")).strip()
+            if not assumption:
+                continue
+            registry.append({
+                "source": episode.get("source"),
+                "forbidden_assumption": assumption,
+                "reentry_condition": str(trace.get("reentry_condition", "")).strip(),
+                "tokens": semantic_tokens(assumption),
+            })
+    warnings = []
+    _, governance = reduce_governance(workspace, scope, warnings)
+    if warnings or governance["issues"]:
+        raise ValueError(
+            "collapse trace governance registry is invalid: "
+            + "; ".join(warnings + governance["issues"])
+        )
+    for target_ref, target in governance.get("targets", {}).items():
+        trace = target.get("collapse_trace") or {}
+        assumption = str(trace.get("forbidden_assumption", "")).strip()
+        if not assumption:
+            continue
+        registry.append({
+            "source": target_ref,
+            "forbidden_assumption": assumption,
+            "reentry_condition": str(trace.get("reentry_condition", "")).strip(),
+            "tokens": semantic_tokens(assumption),
+        })
+    return registry
+
+
+def matching_forbidden_traces(text_value, registry):
+    """Advisory token-overlap match between candidate text and forbidden assumptions."""
+
+    candidate_tokens = set(semantic_tokens(text_value))
+    matches = []
+    for item in registry:
+        trace_tokens = set(item["tokens"])
+        if not trace_tokens:
+            continue
+        overlap = candidate_tokens.intersection(trace_tokens)
+        if len(overlap) >= max(2, (len(trace_tokens) + 2) // 3):
+            matches.append({
+                "source": item["source"],
+                "forbidden_assumption": item["forbidden_assumption"],
+                "reentry_condition": item["reentry_condition"],
+                "matched_tokens": sorted(overlap)[:12],
+            })
+    return matches
+
+
+def trace_reentry_advisories(workspace, scope, text_value):
+    advisories, _ = trace_reentry_advisory_result(workspace, scope, text_value)
+    return advisories
+
+
+def trace_reentry_advisory_result(workspace, scope, text_value):
+    try:
+        registry = collapse_trace_registry(workspace, scope)
+    except (OSError, ValueError, RuntimeError) as exc:
+        return [], {
+            "error": type(exc).__name__,
+            "message": str(exc),
+            "authority": "advisory_failure_never_blocks_or_authorizes",
+        }
+    if not registry:
+        return [], None
+    matches = matching_forbidden_traces(text_value, registry)
+    return [
+        {
+            **match,
+            "advisory": "candidate overlaps a collapsed route's forbidden assumption; "
+                        "re-entry requires the declared new evidence, not a rename",
+        }
+        for match in matches
+    ], None
+
+
+def attach_trace_advisory_result(output, workspace, scope, text_value):
+    advisories, advisory_error = trace_reentry_advisory_result(
+        workspace, scope, text_value
+    )
+    if advisories:
+        output["trace_advisories"] = advisories
+    if advisory_error:
+        output["trace_advisory_error"] = advisory_error
+
+
+FAILED_OR_BLOCKED_OUTCOMES = {"failed", "failure", "blocked"}
+
+
+def recordable_governance_refs(refs, workspace, scope):
+    recordable = []
+    rejected = []
+    for ref in list(dict.fromkeys(refs)):
+        try:
+            governance_evidence_refs([ref], workspace, scope)
+        except (OSError, ValueError, RuntimeError) as exc:
+            rejected.append({"ref": ref, "reason": str(exc)})
+        else:
+            recordable.append(ref)
+    return recordable, rejected
+
+
+def current_scope_frame_id(workspace, scope, episodes):
+    if not episodes:
+        return None
+    ordered = sorted(
+        episodes,
+        key=lambda item: item.get("head_timestamp_utc", ""),
+        reverse=True,
+    )
+    for episode in ordered:
+        frame_id = episode.get("frame_id")
+        if frame_id:
+            return frame_id
+    return None
+
+
+def active_pressure_covers(governance, target_ref, kind, evidence_refs):
+    evidence_set = set(evidence_refs)
+    for pressure in governance.get("pressures", {}).values():
+        if (
+            pressure.get("target_ref") == target_ref
+            and pressure.get("kind") == kind
+            and pressure.get("active")
+        ):
+            if not evidence_set or evidence_set.issubset(set(pressure.get("evidence_refs", []))):
+                return True
+    return False
+
+
+@memoized_derivation
+def command_trace_check(args):
+    workspace = canonical_workspace(args.workspace)
+    scope = normalize_scope(args.scope)
+    registry = collapse_trace_registry(workspace, scope)
+    matches = matching_forbidden_traces(args.text, registry)
+    print(json.dumps({
+        "workspace": workspace,
+        "scope": scope,
+        "trace_count": len(registry),
+        "matches": matches,
+        "authority": "read_only_advisory_never_blocks_or_authorizes",
+    }, ensure_ascii=False, indent=2))
+    return 0 if not matches else 2
+
+
+@memoized_derivation
+def command_governance_pressure_derive(args):
+    """Read-only pressure derivation: the scope's own evidence, surfaced.
+
+    Never writes. Recordable suggestions carry a ready-to-run
+    governance-pressure-record command; recording stays an explicit act.
+    """
+
+    workspace = canonical_workspace(args.workspace)
+    scope = normalize_scope(args.scope)
+    warnings = []
+    _, governance = reduce_governance(workspace, scope, warnings)
+    if warnings or governance["issues"]:
+        raise ValueError(
+            "governance state is invalid: " + "; ".join(warnings + governance["issues"])
+        )
+    index = load_episode_index(workspace, scope)
+    if not episode_index_is_fresh(index, workspace, scope):
+        index = build_episode_index_value(workspace, scope)
+    episodes = index.get("episodes", [])
+    suggestions = []
+    informational = []
+
+    def record_command(target_ref, kind, strength, evidence_refs, frame_id, required_change):
+        if not evidence_refs or not frame_id:
+            return None
+        parts = [
+            "python scripts/weilan_trace.py governance-pressure-record",
+            f'--workspace "{workspace}"', f'--scope "{scope}"',
+            f'--target-ref "{target_ref}"', f"--kind {kind}", f"--strength {strength}",
+        ]
+        parts.extend(f'--evidence "{ref}"' for ref in evidence_refs)
+        parts.append(f'--required-change "{required_change}" --frame-id "{frame_id}"')
+        return " ".join(parts)
+
+    active_states = {"ACTIVE", "WARNED", "PROBATION"}
+    for target_ref, target in governance.get("targets", {}).items():
+        if target.get("state") not in active_states:
+            continue
+        target_tokens = set(semantic_tokens(
+            " ".join([target_ref] + list(target.get("death_lines", [])))
+        ))
+        failed = []
+        for episode in episodes:
+            if episode.get("outcome") not in FAILED_OR_BLOCKED_OUTCOMES:
+                continue
+            episode_tokens = set(episode.get("tokens", []))
+            if len(target_tokens.intersection(episode_tokens)) >= 2:
+                failed.append(episode)
+        if len(failed) >= 2 and not active_pressure_covers(
+            governance, target_ref, "contradiction",
+            [episode["source"] for episode in failed[:4]],
+        ):
+            strength = "strong" if len(failed) >= 3 else "medium"
+            evidence_refs = [episode["source"] for episode in failed[:4]]
+            frame_id = failed[-1].get("frame_id") or current_scope_frame_id(
+                workspace, scope, episodes
+            )
+            required_change = "address repeated failed or blocked episodes"
+            ready_command = record_command(
+                target_ref, "contradiction", strength, evidence_refs, frame_id, required_change
+            )
+            suggestions.append({
+                "kind": "contradiction",
+                "target_ref": target_ref,
+                "strength": strength,
+                "reason": f"{len(failed)} closed episodes overlapping this target "
+                          "ended in failure or blocked without a recorded pressure",
+                "evidence_refs": evidence_refs,
+                "ready_command": ready_command,
+                "recordable": ready_command is not None,
+            })
+        snapshots = target.get("source_snapshots", [])
+        if snapshots and not governance_snapshots_fresh(snapshots, workspace):
+            # a suppressed contradiction must not suppress this target's
+            # staleness derivation, so no early continue above this point
+            if active_pressure_covers(governance, target_ref, "staleness", []):
+                continue
+            evidence_refs, rejected_refs = recordable_governance_refs(
+                list(target.get("source_refs", []))[:4], workspace, scope
+            )
+            frame_id = current_scope_frame_id(workspace, scope, episodes)
+            required_change = "refresh registered source snapshots"
+            ready_command = record_command(
+                target_ref, "staleness", "medium", evidence_refs, frame_id, required_change
+            )
+            suggestion = {
+                "kind": "staleness",
+                "target_ref": target_ref,
+                "strength": "medium",
+                "reason": "registered source snapshots no longer match their sources",
+                "evidence_refs": evidence_refs,
+                "recordable": ready_command is not None,
+            }
+            if ready_command:
+                suggestion["ready_command"] = ready_command
+            else:
+                suggestion["recording_blocked_reason"] = (
+                    "no current frame or no still-recordable evidence refs"
+                )
+            if rejected_refs:
+                suggestion["rejected_evidence_refs"] = rejected_refs
+            suggestions.append(suggestion)
+
+    target_token_sets = [
+        set(semantic_tokens(" ".join([ref] + list(target.get("death_lines", [])))))
+        for ref, target in governance.get("targets", {}).items()
+    ]
+    orphan_failures = []
+    for episode in episodes:
+        if episode.get("outcome") not in FAILED_OR_BLOCKED_OUTCOMES:
+            continue
+        episode_tokens = set(episode.get("tokens", []))
+        if not any(len(tokens.intersection(episode_tokens)) >= 2 for tokens in target_token_sets):
+            orphan_failures.append(episode["source"])
+    if len(orphan_failures) >= 2:
+        informational.append({
+            "kind": "unregistered_risk",
+            "reason": f"{len(orphan_failures)} failed or blocked episodes match no "
+                      "registered governance target; consider governance-target-register",
+            "evidence_refs": orphan_failures[:4],
+        })
+
+    print(json.dumps({
+        "workspace": workspace,
+        "scope": scope,
+        "mode": "read_only_derivation_no_pressure_recorded",
+        "episode_count": len(episodes),
+        "target_count": len(governance.get("targets", {})),
+        "suggestions": suggestions,
+        "informational": informational,
+        "authority": "derived_suggestions_never_pressure_until_explicitly_recorded",
+    }, ensure_ascii=False, indent=2))
+    return 0 if not suggestions else 2
+
+
 def command_governance_show(args):
     workspace = canonical_workspace(args.workspace)
     scope = normalize_scope(args.scope)
@@ -3137,10 +4245,29 @@ def command_governance_show(args):
             for pressure_id, pressure in state["pressures"].items()
             if pressure["target_ref"] == args.target_ref
         }
+    limit = getattr(args, "limit", 20)
+    result["pressure_count"] = len(result["pressures"])
+    if limit and len(result["pressures"]) > limit:
+        newest = sorted(
+            result["pressures"].items(),
+            key=lambda item: item[1].get("timestamp_utc", ""),
+            reverse=True,
+        )[:limit]
+        result["pressures"] = dict(newest)
+        result["pressures_truncated"] = True
+    if limit:
+        for target_ref, target in list(result["targets"].items()):
+            history = target.get("transition_history")
+            if isinstance(history, list) and len(history) > limit:
+                trimmed = dict(target)
+                trimmed["transition_history"] = history[-limit:]
+                trimmed["transition_history_truncated"] = True
+                result["targets"][target_ref] = trimmed
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 1 if result["issues"] else 0
 
 
+@memoized_derivation
 def build_self_projection(workspace, scope):
     workspace = canonical_workspace(workspace)
     scope = normalize_scope(scope)
@@ -3222,6 +4349,7 @@ def command_self_project(args):
     return 1 if result["issues"] else 0
 
 
+@memoized_derivation
 def current_metabolic_contract(workspace, scope):
     workspace = canonical_workspace(workspace)
     scope = normalize_scope(scope)
@@ -3766,9 +4894,15 @@ def command_metabolic_commit(args):
     )
     reset_visibility_snapshot()
     result = transaction_summary(transaction, state)
-    result["refreshed_views"] = refresh_transaction_derived_views(
-        workspace, scope, transaction
-    )
+    try:
+        result["refreshed_views"] = refresh_transaction_derived_views(
+            workspace, scope, transaction
+        )
+    except OSError as exc:
+        # the commit is durable; derived views are rebuildable caches, so a
+        # transient Windows share violation must not report a failed command
+        result["refreshed_views"] = []
+        result["refresh_deferred"] = str(exc)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
@@ -3802,9 +4936,15 @@ def command_metabolic_recover(args):
     )
     reset_visibility_snapshot()
     result = transaction_summary(transaction, state)
-    result["refreshed_views"] = refresh_transaction_derived_views(
-        workspace, scope, transaction
-    )
+    try:
+        result["refreshed_views"] = refresh_transaction_derived_views(
+            workspace, scope, transaction
+        )
+    except OSError as exc:
+        # the commit is durable; derived views are rebuildable caches, so a
+        # transient Windows share violation must not report a failed command
+        result["refreshed_views"] = []
+        result["refresh_deferred"] = str(exc)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
@@ -3824,15 +4964,24 @@ def command_metabolic_transaction_show(args):
             raise ValueError("transaction not found")
         result = transaction_summary(transaction, state)
     else:
+        summaries = [
+            transaction_summary(value, state)
+            for value in transactions.values()
+        ]
+        total = len(summaries)
+        limit = getattr(args, "limit", 20)
+        truncated = False
+        if limit and total > limit:
+            summaries = summaries[-limit:]
+            truncated = True
         result = {
             "schema_version": TRANSACTION_SCHEMA_VERSION,
             "workspace": workspace,
             "scope": scope,
-            "transaction_count": len(transactions),
-            "transactions": [
-                transaction_summary(value, state)
-                for _, value in sorted(transactions.items())
-            ],
+            "transaction_count": total,
+            "returned_count": len(summaries),
+            "truncated": truncated,
+            "transactions": summaries,
             "journal_head": {
                 "event_id": state["head_event_id"],
                 "sequence": state["head_sequence"],
@@ -3919,7 +5068,7 @@ def transition_trigger_timestamp(workspace, scope, proposal, governance_records,
         )
         return match.get("timestamp_utc", "") if match else ""
     if ref.startswith("evidence:"):
-        evidence = find_evidence(ref.split(":", 1)[1])
+        evidence = find_evidence(ref.split(":", 1)[1], workspace=workspace, scope=scope)
         return evidence.get("timestamp_utc", "")
     pressure_matches = [
         value
@@ -4086,9 +5235,9 @@ def materialize_transition_args(args, expected_contract_hash=None):
     if existing_id:
         transaction = state["transactions"][existing_id]
         if transaction.get("request_hash") != caller_request_hash:
-            raise ValueError("idempotency_conflict")
+            raise ContractConflict("idempotency_conflict")
         if expected_contract_hash and transaction.get("contract_hash") != expected_contract_hash:
-            raise ValueError("contract_head_changed")
+            raise ContractConflict("contract_head_changed")
         if transaction["state"] == "PREPARING":
             transaction, state = recover_transaction(
                 state_root(),
@@ -4123,7 +5272,7 @@ def materialize_transition_args(args, expected_contract_hash=None):
     else:
         contract, proposal, plan = derive_transition_plan_from_args(args)
         if expected_contract_hash and contract["contract_hash"] != expected_contract_hash:
-            raise ValueError("contract_head_changed")
+            raise ContractConflict("contract_head_changed")
         if not plan:
             return {
                 "materialized": False,
@@ -4423,9 +5572,23 @@ def command_memory_index(args):
 def command_memory_disposition(args):
     workspace = canonical_workspace(args.workspace)
     scope = normalize_scope(args.scope)
+    with contract_fence(
+        state_root(), workspace_key(workspace), scope_key(scope)
+    ):
+        return command_memory_disposition_fenced(args, workspace, scope)
+
+
+def command_memory_disposition_fenced(args, workspace, scope):
     entries = load_semantic_entries(workspace, scope, [])
     if args.memory_id not in {entry.get("memory_id") for entry in entries}:
         raise ValueError(f"unknown scoped semantic memory: {args.memory_id}")
+    displaced = []
+    if args.state == "active":
+        # reload-check-write happens inside the same contract fence, so two
+        # concurrent growers cannot both pass the budget on one stale active set
+        displaced = enforce_semantic_budget(
+            workspace, scope, 1, getattr(args, "displace", []), warnings=[]
+        )
     event = {
         "schema_version": SEMANTIC_DISPOSITION_SCHEMA_VERSION,
         "event_id": str(uuid.uuid4()),
@@ -4442,6 +5605,8 @@ def command_memory_disposition(args):
     }
     path = semantic_disposition_directory(workspace, scope) / f"{datetime.now(timezone.utc):%Y-%m-%d}.jsonl"
     append_event(path, event)
+    if displaced:
+        append_displacement_dispositions(workspace, scope, displaced, args.memory_id)
     index = rebuild_semantic_index(workspace, scope, [])
     print(json.dumps({
         "saved": True,
@@ -4454,11 +5619,13 @@ def command_memory_disposition(args):
     }, ensure_ascii=False, indent=2))
 
 
+@memoized_derivation
 def command_memory_retention_plan(args):
-    if args.max_active < 0:
-        raise ValueError("--max-active cannot be negative")
     workspace = canonical_workspace(args.workspace)
     scope = normalize_scope(args.scope)
+    max_active = args.max_active if args.max_active is not None else semantic_budget(workspace, scope)
+    if max_active < 0:
+        raise ValueError("--max-active cannot be negative")
     warnings = []
     entries = active_semantic_entries(
         load_semantic_entries(workspace, scope, warnings), workspace, scope, warnings
@@ -4466,24 +5633,26 @@ def command_memory_retention_plan(args):
     protected_kinds = {"constraint", "open_question"}
     protected = [entry for entry in entries if entry.get("kind") in protected_kinds or "critical" in entry.get("tags", [])]
     candidates = [entry for entry in entries if entry not in protected]
-    overflow = max(0, len(entries) - args.max_active)
+    overflow = max(0, len(entries) - max_active)
     proposed = candidates[:overflow]
     print(json.dumps({
         "workspace": workspace,
         "scope": scope,
         "mode": "plan_only_no_state_changed",
-        "max_active": args.max_active,
+        "max_active": max_active,
+        "budget_head": semantic_budget(workspace, scope),
         "active_count": len(entries),
         "protected_count": len(protected),
         "proposed_dormant": [
             {"memory_id": entry["memory_id"], "kind": entry["kind"], "summary": entry["summary"]}
             for entry in proposed
         ],
-        "bounded": len(entries) - len(proposed) <= max(args.max_active, len(protected)),
+        "bounded": len(entries) - len(proposed) <= max(max_active, len(protected)),
         "warnings": warnings,
     }, ensure_ascii=False, indent=2))
 
 
+@memoized_derivation
 def command_memory_conflicts(args):
     workspace = canonical_workspace(args.workspace)
     scope = normalize_scope(args.scope)
@@ -4518,23 +5687,53 @@ def frame_scope(events):
     return normalize_scope(events[0].get("data", {}).get("causal", {}).get("scope"))
 
 
+def corrupt_frame_is_foreign(path, workspace, scope):
+    for _, _, raw, _ in iter_ledger_lines(path):
+        if not raw.strip():
+            continue
+        try:
+            first = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        frame_workspace = first.get("workspace")
+        if not frame_workspace:
+            return False
+        return (
+            normalized_workspace(frame_workspace) != normalized_workspace(workspace)
+            or frame_scope([first]).casefold() != normalize_scope(scope).casefold()
+        )
+    return False
+
+
 def scoped_frame_paths(workspace, scope):
     workspace = canonical_workspace(workspace)
     scope = normalize_scope(scope)
-    paths = []
-    root = state_root() / "frames"
-    if not root.exists():
+
+    def scan():
+        paths = []
+        root = state_root() / "frames"
+        if not root.exists():
+            return paths
+        for path in sorted(root.glob("*/*.jsonl")):
+            try:
+                events = read_events(path)
+            except (OSError, ValueError, RuntimeError) as exc:
+                if corrupt_frame_is_foreign(path, workspace, scope):
+                    sys.stderr.write(f"weilan warning: skipping unreadable frame file {path.name}: {exc}\n")
+                    continue
+                raise
+            if not events:
+                continue
+            if normalized_workspace(events[0].get("workspace", "")) != normalized_workspace(workspace):
+                continue
+            if frame_scope(events).casefold() != scope.casefold():
+                continue
+            paths.append(path)
         return paths
-    for path in sorted(root.glob("*/*.jsonl")):
-        events = read_events(path)
-        if not events:
-            continue
-        if normalized_workspace(events[0].get("workspace", "")) != normalized_workspace(workspace):
-            continue
-        if frame_scope(events).casefold() != scope.casefold():
-            continue
-        paths.append(path)
-    return paths
+
+    return memoized_value(
+        ("scoped_frame_paths", workspace_key(workspace), scope_key(scope)), scan
+    )
 
 
 def frame_source_state(paths):
@@ -4660,6 +5859,7 @@ def episode_index_is_fresh(index, workspace, scope):
     return bool(index) and index.get("source_state") == frame_source_state(scoped_frame_paths(workspace, scope))
 
 
+@memoized_derivation
 def command_episode_index(args):
     index = rebuild_episode_index(args.workspace, args.scope)
     print(json.dumps({
@@ -4671,6 +5871,7 @@ def command_episode_index(args):
     }, ensure_ascii=False, indent=2))
 
 
+@memoized_derivation
 def command_episode_search(args):
     if args.limit < 1 or args.limit > 100:
         raise ValueError("--limit must be between 1 and 100")
@@ -4709,6 +5910,7 @@ def command_episode_search(args):
     }, ensure_ascii=False, indent=2))
 
 
+@memoized_derivation
 def command_memory_search(args):
     requested = canonical_workspace(args.workspace)
     if args.limit < 1 or args.limit > 100:
@@ -4798,14 +6000,18 @@ def command_memory_search(args):
     print(json.dumps(output, ensure_ascii=False, indent=2))
 
 
+@memoized_derivation
 def command_memory_archive_plan(args):
     workspace = canonical_workspace(args.workspace)
     try:
         cutoff = datetime.strptime(args.before, "%Y-%m-%d").date()
     except ValueError as exc:
         raise ValueError("--before must use YYYY-MM-DD") from exc
-    controls, _ = load_control_records()
-    projections, _ = load_projection_records()
+    corruption_warnings = []
+    controls, control_warnings = load_control_records()
+    projections, projection_warnings = load_projection_records()
+    corruption_warnings.extend(control_warnings)
+    corruption_warnings.extend(projection_warnings)
     referenced_frames = {
         source.split(":", 1)[1]
         for projection in projections
@@ -4820,7 +6026,7 @@ def command_memory_archive_plan(args):
                 continue
             records = []
             for path in sorted(directory.glob("*.jsonl")):
-                records.extend(read_jsonl_records(path, []))
+                records.extend(read_jsonl_records(path, corruption_warnings))
             for entry in active_semantic_entries(records):
                 referenced_frames.update(
                     source.split(":", 1)[1]
@@ -4836,7 +6042,16 @@ def command_memory_archive_plan(args):
             continue
         if shard_date >= cutoff:
             continue
-        events = read_events(path)
+        try:
+            events = read_events(path)
+        except (OSError, ValueError, RuntimeError) as exc:
+            # an unreadable frame can never be archive-eligible
+            blocked.append({
+                "frame_id": None,
+                "path": str(path),
+                "reasons": [f"unreadable_frame_shard: {exc}"],
+            })
+            continue
         if not events or normalized_workspace(events[0].get("workspace", "")) != normalized_workspace(workspace):
             continue
         frame_id = events[0].get("frame_id")
@@ -4851,6 +6066,26 @@ def command_memory_archive_plan(args):
             blocked.append(item)
         else:
             eligible.append(item)
+    if corruption_warnings:
+        # a corrupt reference ledger could hide a real reference; never emit an
+        # eligibility list derived from partial evidence
+        print(
+            json.dumps(
+                {
+                    "workspace": workspace,
+                    "before": args.before,
+                    "mode": "plan_only_no_files_moved_or_deleted",
+                    "planning_blocked": True,
+                    "reason": "reference_ledger_corruption_detected",
+                    "corruption_warnings": corruption_warnings[:20],
+                    "eligible_closed_frames": [],
+                    "blocked_frames": blocked,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 1
     print(
         json.dumps(
             {
@@ -4935,6 +6170,7 @@ def save_projection(projection):
     return path
 
 
+@memoized_derivation
 def command_projection_rebuild(args):
     workspace = canonical_workspace(args.workspace)
     scope = normalize_scope(args.scope)
@@ -4981,8 +6217,27 @@ def command_projection_rebuild(args):
         scope,
         semantic_warnings,
     )
-    decisions = [entry["summary"] for entry in semantic_entries if entry.get("kind") in {"decision", "constraint", "fact", "lesson"}][-8:]
-    open_questions = [entry["summary"] for entry in semantic_entries if entry.get("kind") == "open_question"][-8:]
+    uncontested_entries = [entry for entry in semantic_entries if not entry.get("contested_with")]
+    contested_entries = [entry for entry in semantic_entries if entry.get("contested_with")]
+    decisions = [
+        entry["summary"]
+        for entry in uncontested_entries
+        if entry.get("kind") in {"decision", "constraint", "fact", "lesson"}
+    ][-8:]
+    open_questions = [
+        entry["summary"]
+        for entry in uncontested_entries
+        if entry.get("kind") == "open_question"
+    ][-8:]
+    contested_semantic_entries = [
+        {
+            "memory_id": entry["memory_id"],
+            "kind": entry.get("kind"),
+            "summary": entry.get("summary", ""),
+            "contested_with": entry.get("contested_with", []),
+        }
+        for entry in contested_entries[-8:]
+    ]
     holder = (current_episode or {}).get("holders", [])
     latest_holder = holder[-1] if holder else {}
     if current_episode and current_episode.get("outcome") == "open":
@@ -5011,6 +6266,7 @@ def command_projection_rebuild(args):
         "next_action": next_action,
         "decisions": decisions,
         "open_questions": open_questions,
+        "contested_semantic_entries": contested_semantic_entries,
         "sources": sources,
         "source_snapshots": source_snapshots(sources, workspace),
         "control_heads": {
@@ -5020,6 +6276,10 @@ def command_projection_rebuild(args):
     }
     path = save_projection(projection)
     warnings.extend(semantic_warnings)
+    if contested_semantic_entries:
+        warnings.append(
+            f"{len(contested_semantic_entries)} active semantic entries are contested and omitted from clean decisions"
+        )
     print(json.dumps({
         "rebuilt": True,
         "projection_id": projection["projection_id"],
@@ -5152,6 +6412,7 @@ def evaluate_activation(workspace, scope, projection, controls):
     }
 
 
+@memoized_derivation
 def command_memory_recall(args):
     requested = canonical_workspace(args.workspace)
     controls, control_warnings = load_control_records()
@@ -5363,6 +6624,7 @@ def build_parser():
     )
     prospective_show_parser.add_argument("--workspace", default=os.getcwd())
     prospective_show_parser.add_argument("--scope", required=True)
+    prospective_show_parser.add_argument("--limit", type=int, default=20, help="max entries in listing output; 0 = unlimited")
     prospective_show_parser.set_defaults(func=command_prospective_show)
 
     governance_target_parser = subparsers.add_parser(
@@ -5457,12 +6719,30 @@ def build_parser():
     governance_transition_parser.add_argument("--replacement-target-ref")
     governance_transition_parser.set_defaults(func=command_governance_target_transition)
 
+    trace_check_parser = subparsers.add_parser(
+        "trace-check",
+        help="read-only advisory match of text against the scope's collapse traces",
+    )
+    trace_check_parser.add_argument("--workspace", default=os.getcwd())
+    trace_check_parser.add_argument("--scope", required=True)
+    trace_check_parser.add_argument("--text", required=True)
+    trace_check_parser.set_defaults(func=command_trace_check)
+
+    pressure_derive_parser = subparsers.add_parser(
+        "governance-pressure-derive",
+        help="read-only pressure suggestions derived from scope evidence; records nothing",
+    )
+    pressure_derive_parser.add_argument("--workspace", default=os.getcwd())
+    pressure_derive_parser.add_argument("--scope", required=True)
+    pressure_derive_parser.set_defaults(func=command_governance_pressure_derive)
+
     governance_show_parser = subparsers.add_parser(
         "governance-show", help="deterministically replay and show scoped Memory 0.6 governance state"
     )
     governance_show_parser.add_argument("--workspace", default=os.getcwd())
     governance_show_parser.add_argument("--scope", required=True)
     governance_show_parser.add_argument("--target-ref")
+    governance_show_parser.add_argument("--limit", type=int, default=20, help="max entries in listing output; 0 = unlimited")
     governance_show_parser.set_defaults(func=command_governance_show)
 
     self_project_parser = subparsers.add_parser(
@@ -5550,6 +6830,7 @@ def build_parser():
     metabolic_show_parser.add_argument("--workspace", default=os.getcwd())
     metabolic_show_parser.add_argument("--scope", required=True)
     metabolic_show_parser.add_argument("--transaction-id")
+    metabolic_show_parser.add_argument("--limit", type=int, default=20, help="max entries in listing output; 0 = unlimited")
     metabolic_show_parser.set_defaults(func=command_metabolic_transaction_show)
 
     for command_name, help_text, handler in (
@@ -5708,6 +6989,7 @@ def build_parser():
     evidence_promote_parser.add_argument("--scope", default="workspace")
     evidence_promote_parser.add_argument("--evidence-id", required=True)
     evidence_promote_parser.add_argument("--kind", choices=SEMANTIC_KINDS, required=True)
+    evidence_promote_parser.add_argument("--displace", action="append", default=[], help="active memory id to make dormant when the semantic budget is full")
     evidence_promote_parser.add_argument("--summary", required=True)
     evidence_promote_parser.add_argument("--detail", default="")
     evidence_promote_parser.add_argument("--tag", action="append", default=[])
@@ -5718,6 +7000,24 @@ def build_parser():
     evidence_promote_parser.add_argument("--reusable", action="store_true")
     evidence_promote_parser.add_argument("--privacy-reviewed", action="store_true")
     evidence_promote_parser.set_defaults(func=command_evidence_promote)
+
+    memory_note_parser = subparsers.add_parser(
+        "memory-note",
+        help="atomically capture and promote one source-backed conversation conclusion",
+    )
+    memory_note_parser.add_argument("--workspace", default=os.getcwd())
+    memory_note_parser.add_argument("--scope", default="workspace")
+    memory_note_parser.add_argument("--signal", choices=EVIDENCE_SIGNALS, required=True)
+    memory_note_parser.add_argument("--claim", required=True)
+    memory_note_parser.add_argument("--source", action="append", required=True)
+    memory_note_parser.add_argument("--kind", choices=SEMANTIC_KINDS, required=True)
+    memory_note_parser.add_argument("--summary", required=True)
+    memory_note_parser.add_argument("--detail", default="")
+    memory_note_parser.add_argument("--tag", action="append", default=[])
+    memory_note_parser.add_argument("--stable", action="store_true")
+    memory_note_parser.add_argument("--reusable", action="store_true")
+    memory_note_parser.add_argument("--privacy-reviewed", action="store_true")
+    memory_note_parser.set_defaults(func=command_memory_note)
 
     evidence_disposition_parser = subparsers.add_parser(
         "evidence-disposition",
@@ -5739,6 +7039,7 @@ def build_parser():
     evidence_show_parser.add_argument("--workspace", default=os.getcwd())
     evidence_show_parser.add_argument("--scope", default="workspace")
     evidence_show_parser.add_argument("--evidence-id")
+    evidence_show_parser.add_argument("--limit", type=int, default=20, help="max entries in listing output; 0 = unlimited")
     evidence_show_parser.set_defaults(func=command_evidence_show)
 
     persistence_audit_parser = subparsers.add_parser(
@@ -5775,8 +7076,48 @@ def build_parser():
     memory_consolidate_parser.add_argument("--tag", action="append", default=[])
     memory_consolidate_parser.add_argument("--source", action="append", required=True)
     memory_consolidate_parser.add_argument("--supersedes", action="append", default=[])
+    memory_consolidate_parser.add_argument("--displace", action="append", default=[], help="active memory id to make dormant when the semantic budget is full")
     memory_consolidate_parser.add_argument("--conflicts-with", action="append", default=[])
     memory_consolidate_parser.set_defaults(func=command_memory_consolidate)
+
+    memory_budget_parser = subparsers.add_parser(
+        "memory-budget-set",
+        help="set the binding active-recall budget for one scope (append-only head)",
+    )
+    memory_budget_parser.add_argument("--workspace", default=os.getcwd())
+    memory_budget_parser.add_argument("--scope", default="workspace")
+    memory_budget_parser.add_argument("--max-active", type=int, required=True)
+    memory_budget_parser.add_argument("--reason", required=True)
+    memory_budget_parser.set_defaults(func=command_memory_budget_set)
+
+    memory_merge_parser = subparsers.add_parser(
+        "memory-merge",
+        help="merge redundant active semantic memories into one entry with full lineage",
+    )
+    memory_merge_parser.add_argument("--workspace", default=os.getcwd())
+    memory_merge_parser.add_argument("--scope", default="workspace")
+    memory_merge_parser.add_argument("--from", dest="from_id", action="append", required=True)
+    memory_merge_parser.add_argument("--kind", choices=SEMANTIC_KINDS, required=True)
+    memory_merge_parser.add_argument("--summary", required=True)
+    memory_merge_parser.add_argument("--detail", default="")
+    memory_merge_parser.add_argument("--tag", action="append", default=[])
+    memory_merge_parser.add_argument("--source", action="append", default=[])
+    memory_merge_parser.add_argument("--displace", action="append", default=[], help="active memory id to make dormant when the semantic budget is full")
+    memory_merge_parser.set_defaults(func=command_memory_merge)
+
+    memory_split_parser = subparsers.add_parser(
+        "memory-split",
+        help="split one over-mixed active semantic memory into parts with full lineage",
+    )
+    memory_split_parser.add_argument("--workspace", default=os.getcwd())
+    memory_split_parser.add_argument("--scope", default="workspace")
+    memory_split_parser.add_argument("--memory-id", required=True)
+    memory_split_parser.add_argument(
+        "--part", action="append", required=True,
+        help='JSON object: {"summary": ..., "detail"?: ..., "kind"?: ..., "tags"?: [...]}',
+    )
+    memory_split_parser.add_argument("--displace", action="append", default=[], help="active memory id to make dormant when the semantic budget is full")
+    memory_split_parser.set_defaults(func=command_memory_split)
 
     memory_index_parser = subparsers.add_parser(
         "memory-index", help="rebuild the replaceable semantic memory index"
@@ -5794,6 +7135,7 @@ def build_parser():
     memory_disposition_parser.add_argument("--memory-id", required=True)
     memory_disposition_parser.add_argument("--state", choices=SEMANTIC_DISPOSITIONS, required=True)
     memory_disposition_parser.add_argument("--reason", required=True)
+    memory_disposition_parser.add_argument("--displace", action="append", default=[], help="active memory id to make dormant when the semantic budget is full")
     memory_disposition_parser.add_argument("--source", action="append", default=[])
     memory_disposition_parser.set_defaults(func=command_memory_disposition)
 
@@ -5803,7 +7145,7 @@ def build_parser():
     )
     memory_retention_parser.add_argument("--workspace", default=os.getcwd())
     memory_retention_parser.add_argument("--scope", required=True)
-    memory_retention_parser.add_argument("--max-active", type=int, required=True)
+    memory_retention_parser.add_argument("--max-active", type=int, default=None, help="defaults to the scope budget")
     memory_retention_parser.set_defaults(func=command_memory_retention_plan)
 
     memory_conflicts_parser = subparsers.add_parser(

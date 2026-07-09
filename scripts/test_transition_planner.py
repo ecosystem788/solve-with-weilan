@@ -604,6 +604,7 @@ def main():
         method_state = root / "method-state"
         environment = os.environ.copy()
         environment["WEILAN_ALLOW_UNRESOLVED_CONVERSATION"] = "1"
+        environment["WEILAN_CODEX_SESSIONS_HOME"] = str(root / "sessions")
         environment["WEILAN_METHOD_HOME"] = str(method_state)
         continue_test(root, method_state, environment)
         fork_join_test(root, environment)

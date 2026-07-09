@@ -41,7 +41,15 @@ COMMIT is appended only after every pending envelope is present and hash-valid. 
 - a missing receipt does not undo a committed bundle;
 - ABORT leaves staged envelopes permanently invisible without deleting history.
 
-The contract check and coordinator COMMIT share one Contract Commit Fence（契约提交栅栏）. Lock order is workspace fence, scope fence, then transaction lock. Control, lineaged Frame, Governance, Evidence Lifecycle, and Persistence Audit writers use the same workspace/scope fence. The current contract loader runs only after those fences are held, so an internal contract-head mutation is serialized entirely before the check or after COMMIT; a caller-supplied stale hash is never trusted as the current state.
+The contract check and coordinator COMMIT share one Contract Commit Fence（契约提交栅栏）. Lock order is workspace fence, scope fence, then transaction lock. Control, lineaged Frame, Governance, Evidence Lifecycle, Persistence Audit, Evidence Promotion, and semantic consolidation writers use the same workspace/scope fence. PREPARE and recovery staging hold that fence in the same order before the transaction lock, because staging appends pending envelopes into the same participant ledgers that direct writers append to. The current contract loader runs only after those fences are held, so an internal contract-head mutation is serialized entirely before the check or after COMMIT; a caller-supplied stale hash is never trusted as the current state.
+
+## Durability degradation boundaries
+
+An interrupted append can leave one torn unterminated final line in a ledger. Readers skip exactly that torn tail, and the next append seals it: the fragment's byte identity (offset, length, SHA-256) is preserved in an append-only `<ledger>.torn` quarantine sidecar, the fragment becomes an isolated non-record line, and the new record is appended after it. Ledgers are never truncated. Ledger lines are decoded as strict UTF-8; a newline-terminated line with invalid UTF-8 or invalid JSON remains a hard validation error unless its exact byte range is quarantined in the sidecar.
+
+Journal identity replay compares workspace and scope case-insensitively; raw casing differences of the same scope key are not an identity change.
+
+When the coordinator journal itself fails replay, readers do not fail every ledger and frame read in the workspace. Pending envelopes stay invisible — the same conservative treatment as an uncommitted transaction — and one process-level warning names the broken journal until `metabolic-recover` repairs it. An envelope that fails its own integrity validation is still a hard read error for the ledger that contains it.
 
 One top-level CLI command pins a transaction visibility snapshot. A concurrent COMMIT cannot cause that command to observe part of the bundle before the boundary and another part after it.
 

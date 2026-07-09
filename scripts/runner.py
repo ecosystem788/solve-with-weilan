@@ -8,6 +8,14 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from transaction import (
+    ContractConflict,
+    is_quarantined_torn_fragment,
+    iter_ledger_lines,
+    terminate_torn_tail,
+    warn_torn_tail,
+)
+
 
 RUNNER_SCHEMA_VERSION = "weilan_runner_event_v0.7d"
 MANIFEST_SCHEMA_VERSION = "weilan_runner_manifest_v0.7d"
@@ -166,14 +174,18 @@ def raw_read_jsonl(path):
     records = []
     if not Path(path).exists():
         return records
-    with Path(path).open("r", encoding="utf-8") as handle:
-        for number, line in enumerate(handle, 1):
-            if not line.strip():
+    for number, offset, raw, terminated in iter_ledger_lines(path):
+        if not raw.strip():
+            continue
+        try:
+            records.append(json.loads(raw.decode("utf-8")))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            if not terminated:
+                warn_torn_tail(path, number)
                 continue
-            try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"{Path(path).name}:{number}: {exc}") from exc
+            if is_quarantined_torn_fragment(path, offset, raw):
+                continue
+            raise ValueError(f"{Path(path).name}:{number}: {exc}") from exc
     return records
 
 
@@ -187,8 +199,10 @@ def load_run_records(root, workspace_key, scope_key):
 def append_jsonl(path, record):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8", newline="\n") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    line = (json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    with path.open("a+b") as handle:
+        terminate_torn_tail(path, handle)
+        handle.write(line)
         handle.flush()
         os.fsync(handle.fileno())
 
@@ -255,9 +269,9 @@ def reduce_runs(records):
             issues.append(f"{label}: unsupported schema_version")
             continue
         identity = (
-            record.get("workspace"),
+            str(record.get("workspace") or "").casefold(),
             record.get("workspace_key"),
-            record.get("scope"),
+            str(record.get("scope") or "").casefold(),
             record.get("scope_key"),
         )
         if any(not value for value in identity):
@@ -712,7 +726,8 @@ def execute_run(
                     message = str(exc)
                     reason = (
                         "CONFLICT"
-                        if any(
+                        if isinstance(exc, (ContractConflict, RunnerConflict))
+                        or any(
                             token in message
                             for token in (
                                 "contract_head_changed",
@@ -723,6 +738,26 @@ def execute_run(
                         )
                         else "INVALID_EVENT"
                     )
+                    if reason != "CONFLICT" and recovery and recovery.get("state") == "NOT_STARTED":
+                        # the materialization was rejected before any durable
+                        # write; if the scope is now paused/blocked, that is the
+                        # true stop cause, not an invalid event
+                        status_reason = _status_stop_reason(current.get("status"))
+                        if status_reason:
+                            run, state = _append_stop(
+                                root,
+                                workspace,
+                                scope,
+                                workspace_key,
+                                scope_key,
+                                records,
+                                state,
+                                run,
+                                status_reason,
+                                current,
+                                "materialization_blocked_before_start",
+                            )
+                            break
                     if (
                         recovery
                         and recovery.get("state") in {"PREPARING", "PREPARED"}

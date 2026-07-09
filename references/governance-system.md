@@ -142,3 +142,34 @@ python scripts/weilan_trace.py self-project --workspace "<cwd>" --scope "..."
 0.6 is complete when replay is deterministic, withdrawn evidence removes pressure, duplicates do not double count, local collapse does not kill parents, paused and blocked targets remain distinct and recoverable, terminal parents cannot retain active children, propagation is explicit, projection cannot acquire authority, collapse/re-entry are explainable, cross-workspace data is isolated, corrupt events are detected, and the system uses no wall-clock or background heartbeat.
 
 0.6 does not automatically evaluate every response, schedule the next frame, or run feedback-pressure-collapse-regroup as a continuous loop. Memory 0.7a adds only the read-only contract and proposal layer documented in [metabolism-system.md](metabolism-system.md); transaction commits and any bounded runner remain later phases.
+
+## Pressure Derivation（压力派生, read-only）
+
+`governance-pressure-derive --workspace <cwd> --scope <scope>` derives pressure
+suggestions from the scope's own evidence and records nothing:
+
+- two or more failed/blocked episodes whose tokens overlap an ACTIVE/WARNED/PROBATION
+  target suggest a `contradiction` pressure (three or more upgrade the suggested
+  strength to strong), citing the failing frames as evidence;
+- a target whose registered source snapshots no longer match their sources suggests a
+  `staleness` pressure;
+- failed episodes matching no registered target are reported as informational
+  `unregistered_risk`, inviting an explicit `governance-target-register`.
+
+Recordable suggestions carry a ready-to-run `governance-pressure-record` command line.
+When the scope lacks a current causal frame or all stale source refs are no longer valid
+governance evidence, the suggestion is still shown with `recordable: false` plus the
+blocking reason instead of a fake command template. Derivation is a read-only projection
+of evidence; recording pressure remains an explicit act, and nothing transitions
+automatically. Exit code 2 signals suggestions exist.
+
+## Re-entry Trace Advisories（重入痕迹提醒, read-only）
+
+`trace-check --scope <scope> --text "<candidate description>"` matches text against every
+collapse trace in the scope — frame `trace_emitted` events and governance
+`collapse_trace` records alike — by token overlap with each `forbidden_assumption`.
+`candidate_admitted`, `holder_selected`, `route_reentered` events and lineaged `open`
+surface the same advisories automatically in their command output. Advisories never
+block: the constitution's re-entry rule (new evidence satisfying the declared
+`reentry_condition`, not a rename) stays a judgment the caller must make — the mechanism
+only guarantees the trace is seen.

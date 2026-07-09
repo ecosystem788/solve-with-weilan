@@ -46,6 +46,8 @@ memory/runs/workspaces/<workspace-key>/<scope-key>/YYYY-MM-DD.jsonl
 
 Control, event, semantic, evidence, audit, and governance files are append-only and date-sharded. Projections and indexes are derived views and may be replaced atomically.
 
+A crash can leave one torn unterminated final line in an append-only shard. Readers skip exactly that torn tail, and the next append seals it into an isolated line after preserving the fragment's byte identity (offset, length, SHA-256) in an append-only `<shard>.torn` quarantine sidecar. Shards are never truncated; lines are decoded as strict UTF-8, and any terminated undecodable line whose exact byte range is not quarantined remains a hard error. Governance appends validate the replayed ledger before writing, so a concurrent-writer race rejects the losing event instead of persisting an invalid replay. Evidence Promotion and semantic consolidation writers hold the same workspace/scope contract fence as the other direct writers, which keeps "one evidence fragment cannot be promoted twice" true under concurrent sessions.
+
 ## Control events
 
 Record an explicit user pause, resume, stop, block, close, or scope redirection immediately:
@@ -158,11 +160,11 @@ The append-only lineage ledger is the transition evidence. The branch-head JSON 
 
 Lineage governs causal and branch validity only. It never activates a paused, blocked, closed, ambiguous, or stale scope. Activation remains exclusively controlled by user instructions and the control ledger.
 
-For multi-window milestone work, every milestone must leave a closed scoped Frame whose parent is the previous real milestone head. A later window should restore the active scope, inspect `lineage-show`, and continue from that head before making material changes. Synthetic or backfilled Frames are not valid continuity evidence. If the work is a `parcel_route`, `parcel-route`, or parcel routing package, use the exact scope `parcel-route-evolution` for every recall, lineage, Frame, audit, and receipt operation; do not substitute a broader package or project scope.
+For multi-window milestone work, every milestone must leave a closed scoped Frame whose parent is the previous real milestone head. A later window should restore the active scope, inspect `lineage-show`, and continue from that head before making material changes. Synthetic or backfilled Frames are not valid continuity evidence. When the task or its history already names a scope for the work, reuse that exact scope for every recall, lineage, Frame, audit, and receipt operation; do not substitute a broader package or project scope.
 
-For milestone work with hard tool budgets, the expected continuity path is one recall, one lineage inspection, one lineaged open, one batched source read, one focused implementation, one focused verification, and one close/validate. In a three-stage run, hard-target no more than 12 task calls per stage and treat 14 calls in any single stage as the death line for optional exploration so the aggregate remains inside a 40-call budget with recovery room. Combine sequential trace commands in one shell call when their order is known, and do not split file reads one file per tool call. Skip archival, retention planning, semantic searches, self projection, governance inspection, previous-milestone rereads, and duplicate verification commands unless the task explicitly requires them, activation blocks progress, or a verification failure creates new evidence.
+For milestone work with hard tool budgets, the expected continuity path is one recall, one lineage inspection, one lineaged open, one batched source read, one focused implementation, one focused verification, and one close/validate. Divide an aggregate budget roughly evenly across stages and treat clearly overrunning one stage as the death line for optional exploration. Combine sequential trace commands in one shell call when their order is known, and do not split file reads one file per tool call. Skip archival, retention planning, semantic searches, self projection, governance inspection, previous-milestone rereads, and duplicate verification commands unless the task explicitly requires them, activation blocks progress, or a verification failure creates new evidence.
 
-For single-window L2 prototype work with a 16-call budget, memory operations must be front-loaded and batched. A single shell call may perform recall, open one Frame, and record holder metadata. After that, prefer task artifacts such as `decision.json`, `evidence.json`, and a discriminating test over additional memory searches or separate trace events. Do not run `episode-search`, `memory-search`, `projection-rebuild`, retention planning, or governance inspection unless recall returns `STALE`/blocked or the current source contradicts the projection. Passing verification plus complete task artifacts is enough; do not spend reserve calls on standalone JSON pretty-print checks or duplicate test runs.
+For single-window L2 prototype work under a tight tool budget, memory operations must be front-loaded and batched. A single shell call may perform recall, open one Frame, and record holder metadata. After that, prefer task artifacts such as a decision record, an evidence record, and a discriminating test over additional memory searches or separate trace events. Do not run `episode-search`, `memory-search`, `projection-rebuild`, retention planning, or governance inspection unless recall returns `STALE`/blocked or the current source contradicts the projection. Passing verification plus complete task artifacts is enough; do not spend reserve calls on standalone JSON pretty-print checks or duplicate test runs.
 
 ## Conversation Evidence（对话证据层）
 
@@ -188,6 +190,8 @@ Captured evidence is only a candidate. It cannot activate work and is not return
 ```powershell
 python scripts/weilan_trace.py evidence-show --workspace "<cwd>" --scope "memory-system"
 ```
+
+`evidence-show`, `governance-show`, `prospective-show`, and `metabolic-transaction-show` listings return the newest 20 entries by default (`--limit N`, `0` = unlimited) and always report the total count plus a truncated flag, so the caller's context stays bounded regardless of ledger age.
 
 ## Promotion Gate（晋升门）
 
@@ -332,6 +336,21 @@ python scripts/weilan_trace.py memory-search `
 The tokenizer supports lowercase Latin terms and Chinese character/bigram matching. Search reports source freshness for each result. A missing or stale index triggers an in-memory linear fallback so the index cannot hide a live entry. Rebuild the replaceable index explicitly with `memory-index`.
 
 Use direct `memory-consolidate` for non-chat evidence or trusted system-produced results. Chat-derived claims must enter through Conversation Evidence and Promotion Gate. Do not consolidate routine tool calls, transient status, hidden reasoning, raw conversations, credentials, or facts already owned by a project source without adding a useful cross-task conclusion.
+
+## Conservation and reorganization（守恒与重组, Memory 0.8）
+
+The active semantic set is a bounded existence budget, not an unbounded log. Every scope has a binding `max_active` head (default 100, set explicitly with `memory-budget-set --max-active N --reason ...`; append-only history). Once the budget is full, any write that grows the active set — `memory-consolidate`, `evidence-promote`, `memory-split`, or a `memory-disposition --state active` reactivation — must name `--displace <memory-id>`. Displacement appends a dormant disposition (`displaced_by_budget:<new-id>`), reversible and never a deletion. Entries the same write supersedes count as leaving, so a correction or merge at full budget needs no displacement. A rejected admission lists the oldest unprotected displacement candidates; `constraint`, `open_question`, and `critical`-tagged entries are never suggested, though an explicit `--displace` may still name them.
+
+Reorganization is how the set competes instead of merely accumulating:
+
+```powershell
+python scripts/weilan_trace.py memory-merge --workspace "<cwd>" --scope "..." --from <id> --from <id> --kind decision --summary "..."
+python scripts/weilan_trace.py memory-split --workspace "<cwd>" --scope "..." --memory-id <id> --part '{"summary": "..."}' --part '{"summary": "..."}'
+```
+
+`memory-merge` folds redundant active entries into one entry that supersedes all inputs, inherits the union of their sources (including `evidence:` refs — restructuring preserves grounding without re-passing the Promotion Gate), and records `reorganization: {kind: merge, from: [...]}`. `memory-split` breaks one over-mixed entry into two or more grounded parts; only the final part supersedes the parent, so an interrupted split never deactivates the parent before every part is durable. Merged or split entries whose inherited `evidence:` sources later become withdrawn, expired, or superseded leave active recall exactly like promotion-backed entries. Merge and split summaries must have lexical grounding in their inputs; the caller (the LLM) remains the cohesion judge, the ledger only enforces lineage, budget, and grounding.
+
+`memory-retention-plan` now defaults to the scope budget and remains read-only. The dynamics this section adds are deliberately minimal: bounded budget plus explicit merge/split/displace is the method-plane projection of conservation-competition-collapse; there is still no timer, no background loop, and no automatic transition.
 
 ## Archive boundary
 

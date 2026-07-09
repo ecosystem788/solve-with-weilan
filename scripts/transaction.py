@@ -8,6 +8,7 @@ the transaction as committed. No worker, timer, or background loop is used.
 import hashlib
 import json
 import os
+import sys
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -28,6 +29,14 @@ EVENT_TYPES = (
 TERMINAL_STATES = {"COMMITTED", "ABORTED"}
 MAX_INTENTS = 64
 _VISIBILITY_CACHE = ContextVar("weilan_transaction_visibility_cache", default=None)
+
+
+class ContractConflict(ValueError):
+    """A retryable head/idempotency conflict, distinct from invalid input.
+
+    Callers (the bounded runner in particular) classify stops by exception
+    type instead of matching message substrings.
+    """
 
 
 def utc_now():
@@ -79,18 +88,129 @@ def transaction_paths(root, workspace_key, scope_key):
     return sorted(directory.glob("*.jsonl")) if directory.exists() else []
 
 
+def torn_tail_quarantine_path(path):
+    return Path(path).with_name(Path(path).name + ".torn")
+
+
+def iter_ledger_lines(path):
+    """Yield (number, offset, line_bytes, terminated) for each physical ledger line.
+
+    Lines are split on b"\\n" without decoding, so readers can enforce strict
+    UTF-8 per line and address quarantined fragments by byte identity. By
+    construction only the final physical line can be unterminated.
+    """
+
+    data = Path(path).read_bytes()
+    offset = 0
+    number = 0
+    chunks = data.split(b"\n")
+    for chunk in chunks[:-1]:
+        number += 1
+        yield number, offset, chunk, True
+        offset += len(chunk) + 1
+    tail = chunks[-1]
+    if tail:
+        yield number + 1, offset, tail, False
+
+
+def is_quarantined_torn_fragment(path, offset, line_bytes):
+    """Return True only for the exact quarantined fragment at this byte range.
+
+    Matching is by offset, length, and SHA-256 of the fragment bytes, never by
+    text, so a later unrelated bad line with identical content cannot be
+    silently suppressed.
+    """
+
+    quarantine = torn_tail_quarantine_path(path)
+    if not quarantine.exists():
+        return False
+    digest = hashlib.sha256(line_bytes).hexdigest()
+    try:
+        raw_records = quarantine.read_bytes().split(b"\n")
+    except OSError:
+        return False
+    for raw in raw_records:
+        if not raw.strip():
+            continue
+        try:
+            record = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if (
+            record.get("fragment_offset") == offset
+            and record.get("fragment_length") == len(line_bytes)
+            and record.get("fragment_sha256") == digest
+        ):
+            return True
+    return False
+
+
+def warn_torn_tail(path, number):
+    sys.stderr.write(
+        f"weilan warning: ignored torn unterminated line {number} in {Path(path).name}; "
+        "the next append will quarantine it\n"
+    )
+
+
+def terminate_torn_tail(path, handle):
+    """Seal a torn trailing fragment left by an interrupted append.
+
+    The fragment was never a durably committed record. Never truncate the
+    ledger: record the fragment's byte identity (offset, length, SHA-256) in
+    an append-only `.torn` sidecar, then write one newline so the fragment
+    becomes an isolated line that readers skip only at that exact byte range.
+    A concurrent complete append at worst turns this newline into a blank
+    line, which every reader already ignores.
+    """
+
+    handle.seek(0, os.SEEK_END)
+    size = handle.tell()
+    if size == 0:
+        return
+    handle.seek(size - 1)
+    if handle.read(1) == b"\n":
+        return
+    handle.seek(0)
+    data = handle.read()
+    cut = data.rfind(b"\n") + 1
+    fragment = data[cut:]
+    quarantine_record = {
+        "quarantined_at_utc": utc_now(),
+        "source": Path(path).name,
+        "reason": "torn_tail_from_interrupted_append",
+        "fragment_offset": cut,
+        "fragment_length": len(fragment),
+        "fragment_sha256": hashlib.sha256(fragment).hexdigest(),
+        "fragment_preview": fragment.decode("utf-8", "replace"),
+    }
+    quarantine = torn_tail_quarantine_path(path)
+    with quarantine.open("ab") as sidecar:
+        sidecar.write(
+            (json.dumps(quarantine_record, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+        )
+        sidecar.flush()
+        os.fsync(sidecar.fileno())
+    handle.write(b"\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
 def raw_read_jsonl(path):
     records = []
     if not Path(path).exists():
         return records
-    with Path(path).open("r", encoding="utf-8") as handle:
-        for number, line in enumerate(handle, 1):
-            if not line.strip():
+    for number, offset, raw, terminated in iter_ledger_lines(path):
+        if not raw.strip():
+            continue
+        try:
+            records.append(json.loads(raw.decode("utf-8")))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            if not terminated:
+                warn_torn_tail(path, number)
                 continue
-            try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"{Path(path).name}:{number}: {exc}") from exc
+            if is_quarantined_torn_fragment(path, offset, raw):
+                continue
+            raise ValueError(f"{Path(path).name}:{number}: {exc}") from exc
     return records
 
 
@@ -120,8 +240,10 @@ def reset_visibility_snapshot():
 def append_jsonl(path, record):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8", newline="\n") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    line = (json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    with path.open("a+b") as handle:
+        terminate_torn_tail(path, handle)
+        handle.write(line)
         handle.flush()
         os.fsync(handle.fileno())
 
@@ -139,8 +261,30 @@ def exclusive_file_lock(path):
         handle.seek(0)
         if os.name == "nt":
             import msvcrt
+            import time
 
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            # msvcrt LK_LOCK gives up after ~10 one-second retries with a bare
+            # "Permission denied"; keep retrying to a configurable deadline and
+            # then name the real cause so dual-session contention is diagnosable
+            timeout_s = float(os.environ.get("WEILAN_LOCK_TIMEOUT_S", "120"))
+            deadline = time.monotonic() + timeout_s
+            # each msvcrt LK_LOCK call blocks for up to ~10 one-second retries,
+            # so a bounded number of calls covers the whole deadline window
+            attempts = max(1, int(timeout_s / 10) + 1)
+            last_error = None
+            for _ in range(attempts):
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                    last_error = None
+                    break
+                except OSError as exc:
+                    last_error = exc
+                    if time.monotonic() >= deadline:
+                        break
+            if last_error is not None:
+                raise RuntimeError(
+                    f"lock timeout on {path.name}; another weilan session holds it"
+                ) from last_error
             try:
                 yield
             finally:
@@ -180,6 +324,21 @@ def contract_fence(root, workspace_key, scope_key):
     directory = contract_fence_directory(root, workspace_key)
     with workspace_contract_fence(root, workspace_key):
         with exclusive_file_lock(directory / "scopes" / scope_key / ".scope-contract.lock"):
+            yield
+
+
+@contextmanager
+def staging_fence(root, workspace_key, scope_key, directory):
+    """Serialize participant-ledger staging against direct ledger writers.
+
+    Staging appends pending envelopes into the same daily JSONL files that
+    direct writers (control, frame, governance, evidence) append to under the
+    contract fence, so it must hold the same fence. Lock order stays
+    workspace fence, scope fence, then transaction lock, matching COMMIT.
+    """
+
+    with contract_fence(root, workspace_key, scope_key):
+        with exclusive_file_lock(directory / ".transaction.lock"):
             yield
 
 
@@ -236,9 +395,9 @@ def reduce_transactions(records):
             issues.append(f"{label}: unsupported schema_version")
             continue
         identity = (
-            record.get("workspace"),
+            str(record.get("workspace") or "").casefold(),
             record.get("workspace_key"),
-            record.get("scope"),
+            str(record.get("scope") or "").casefold(),
             record.get("scope_key"),
         )
         if any(not value for value in identity):
@@ -507,7 +666,7 @@ def prepare_transaction(
     bundle_hash = stable_hash(intents)
     transaction_id = transaction_id_for(workspace_key, scope_key, idempotency_key)
     directory = transaction_directory(root, workspace_key, scope_key)
-    with exclusive_file_lock(directory / ".transaction.lock"):
+    with staging_fence(root, workspace_key, scope_key, directory):
         records = load_transaction_records(root, workspace_key, scope_key)
         state = reduce_transactions(records)
         if state["issues"]:
@@ -523,7 +682,7 @@ def prepare_transaction(
                 or transaction.get("request_hash") != request_hash
                 or transaction.get("plan_hash") != plan_hash
             ):
-                raise ValueError("idempotency_conflict")
+                raise ContractConflict("idempotency_conflict")
         else:
             started = _append_journal(
                 root,
@@ -603,11 +762,11 @@ def commit_transaction(
             if transaction["state"] == "ABORTED":
                 raise ValueError("aborted transaction cannot commit")
             if transaction["contract_hash"] != expected_contract_hash:
-                raise ValueError("expected contract does not match prepared transaction")
+                raise ContractConflict("expected contract does not match prepared transaction")
             if transaction["state"] != "COMMITTED":
                 current_contract_hash = current_contract_loader()
                 if current_contract_hash != transaction["contract_hash"]:
-                    raise ValueError("contract_head_changed")
+                    raise ContractConflict("contract_head_changed")
             if transaction["state"] == "PREPARING":
                 raise ValueError("transaction is not fully prepared; recover it first")
             if not _all_intents_staged(root, transaction):
@@ -697,7 +856,7 @@ def recover_transaction(
     transaction_id,
 ):
     directory = transaction_directory(root, workspace_key, scope_key)
-    with exclusive_file_lock(directory / ".transaction.lock"):
+    with staging_fence(root, workspace_key, scope_key, directory):
         records = load_transaction_records(root, workspace_key, scope_key)
         state = reduce_transactions(records)
         if state["issues"]:
@@ -736,18 +895,40 @@ def recover_transaction(
         return transaction, state
 
 
+_WARNED_INVALID_JOURNALS = set()
+
+
+def _warn_journal_invalid(key, issues):
+    """Surface a broken transaction journal once per process without wedging readers.
+
+    A corrupt journal must not make every frame or ledger read in the
+    workspace raise; pending envelopes are simply kept invisible, which is the
+    same conservative treatment as an uncommitted transaction.
+    """
+
+    if key in _WARNED_INVALID_JOURNALS:
+        return
+    _WARNED_INVALID_JOURNALS.add(key)
+    summary = issues[0] if issues else "unknown issue"
+    sys.stderr.write(
+        f"weilan warning: transaction journal for workspace_key={key[1]} scope_key={key[2]} "
+        f"is invalid ({len(issues)} issue(s); first: {summary}); pending envelopes stay hidden "
+        "until metabolic-recover repairs the journal\n"
+    )
+
+
 def resolve_pending_record(root, record, warnings=None, source_path=None):
     """Return payload for committed pending records, None while invisible."""
 
     if record.get("schema_version") != PENDING_SCHEMA_VERSION:
         return record
     warnings = warnings if warnings is not None else []
+    key = (
+        str(Path(root).resolve()),
+        record.get("workspace_key", ""),
+        record.get("scope_key", ""),
+    )
     try:
-        key = (
-            str(Path(root).resolve()),
-            record.get("workspace_key", ""),
-            record.get("scope_key", ""),
-        )
         cache = _VISIBILITY_CACHE.get()
         state = cache.get(key) if cache is not None else None
         if state is None:
@@ -756,7 +937,7 @@ def resolve_pending_record(root, record, warnings=None, source_path=None):
             if cache is not None:
                 cache[key] = state
         if state["issues"]:
-            warnings.extend(state["issues"])
+            _warn_journal_invalid(key, state["issues"])
             return None
         transaction = state["transactions"].get(record.get("transaction_id"))
         if not transaction or transaction["state"] != "COMMITTED":
@@ -784,5 +965,5 @@ def resolve_pending_record(root, record, warnings=None, source_path=None):
             return None
         return record["payload"]
     except (OSError, ValueError, TypeError) as exc:
-        warnings.append(str(exc))
+        _warn_journal_invalid(key, [str(exc)])
         return None

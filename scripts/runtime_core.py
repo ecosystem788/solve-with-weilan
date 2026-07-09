@@ -76,10 +76,30 @@ def write_json_atomic(path, value):
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        replace_with_retry(temporary, path)
     finally:
         if temporary.exists():
             temporary.unlink()
+
+
+def replace_with_retry(temporary, path, attempts=5, delay_s=0.1):
+    """os.replace that tolerates a concurrent Windows reader holding the target.
+
+    Derived views are read by sibling sessions without FILE_SHARE_DELETE, which
+    makes MoveFileEx fail transiently with PermissionError.
+    """
+
+    import time
+
+    last_error = None
+    for _ in range(attempts):
+        try:
+            os.replace(temporary, path)
+            return
+        except PermissionError as exc:
+            last_error = exc
+            time.sleep(delay_s)
+    raise last_error
 
 
 def write_event_file_atomic(path, event):
@@ -108,8 +128,30 @@ def exclusive_file_lock(path):
         handle.seek(0)
         if os.name == "nt":
             import msvcrt
+            import time
 
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            # msvcrt LK_LOCK gives up after ~10 one-second retries with a bare
+            # "Permission denied"; keep retrying to a configurable deadline and
+            # then name the real cause so dual-session contention is diagnosable
+            timeout_s = float(os.environ.get("WEILAN_LOCK_TIMEOUT_S", "120"))
+            deadline = time.monotonic() + timeout_s
+            # each msvcrt LK_LOCK call blocks for up to ~10 one-second retries,
+            # so a bounded number of calls covers the whole deadline window
+            attempts = max(1, int(timeout_s / 10) + 1)
+            last_error = None
+            for _ in range(attempts):
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                    last_error = None
+                    break
+                except OSError as exc:
+                    last_error = exc
+                    if time.monotonic() >= deadline:
+                        break
+            if last_error is not None:
+                raise RuntimeError(
+                    f"lock timeout on {path.name}; another weilan session holds it"
+                ) from last_error
             try:
                 yield
             finally:
