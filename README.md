@@ -1,5 +1,8 @@
 # Solve with WeiLan / 微澜方法 Skill
+> [!IMPORTANT]
+> **Archived / 已归档。** This repository is retained as public read-only history. The canonical `solve-with-weilan` source is now [`skill/solve-with-weilan/`](https://github.com/ecosystem788/WeilanSkillEvolution/tree/codex/se-0.4-0.7-program/skill/solve-with-weilan) in WeilanSkillEvolution; use the published [`weilan-windows-first-release-rc5`](https://github.com/ecosystem788/WeilanSkillEvolution/tree/weilan-windows-first-release-rc5) entry. 本仓仅保留公开历史；下方旧安装/更新命令是历史记录，不再是活跃安装入口。
 
+## Historical content / 历史内容
 `solve-with-weilan` is a Codex/agent Skill that applies the WeiLan problem-solving method to ordinary engineering tasks, research work, and long-running agent workflows.
 
 `solve-with-weilan` 是一个 Codex/agent Skill，用来把微澜方法应用到日常工程任务、研究任务和长期 agent 工作流中。
